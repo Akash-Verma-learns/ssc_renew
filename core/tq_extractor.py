@@ -1,48 +1,49 @@
 """
-TQ Extractor (stable)
-=====================
+TQ Extractor v14
+================
 
-Fixes applied in this version
-------------------------------
+Architecture (three clean stages)
+-----------------------------------
 
-BUG A -- Particulars text leaked into parameter name (Eval 33)
-  Row 3 returned as:
-    parameter = "Turnover Minimum Average turnover of 100 Crs in last 3"
-    max_marks = 5
-  This happens when the LLM confuses the Particulars column text with the
-  Parameter Name column on a page break.
-  FIX 1: _CONTAMINATED_PARAM_PATTERNS — drops any criterion whose parameter
-    name looks like it contains Particulars text rather than a short label.
-    Triggers: name > 60 chars AND (contains digits/currency/percent, OR starts
-    with a known Particulars prefix like "Minimum", "Experience in", etc.)
-  FIX 2: _dedup_by_prefix — after validation, if two criteria share the same
-    normalised prefix (first 3 words), keep only the one with the higher
-    max_marks. This catches "Turnover" vs "Turnover Minimum Average...".
+STAGE 1 -- Page selection  (deterministic, zero LLM)
+  Reuses the proven TOC + page-scoring stack from the stable extractor.
+  Finds the exact page cluster that contains the evaluation table
+  (e.g. pages 43-47).  Returns a list of page numbers.
 
-BUG B -- Band value used as max_marks instead of Max. Marks column (Eval 33)
-  Qualifications returned with max_marks=20 (a band value) instead of 25
-  (the actual Max. Marks column value).
-  FIX: Prompt RULE 2 now has a worked example showing that band numbers inside
-    the Particulars cell must never be used as max_marks.
-  FIX: Added post-extraction sanity: if a parameter name matches
-    "Qualification" and max_marks < 20, flag and attempt to correct to the
-    grand_total implied value.
+STAGE 2 -- Table extraction  (Docling primary, LLM fallback)
+  Extracts ONLY those pages from the PDF into a temporary in-memory PDF.
+  Runs Docling's TableFormer on that mini-PDF.
+  Docling returns the scoring table as a pandas DataFrame -- columns
+  S.No | Parameter Name | Particulars/Criteria | Max. Marks | Document.
+  A deterministic parser converts the DataFrame to criterion dicts.
+  No LLM involved.  If Docling is not installed or fails, falls back
+  to the LLM-based extraction used in v13 (proven reliable).
 
-RETAINED from previous version
--------------------------------
-- TOC parser (correctly finds p43-p46)
-- Page scoring stack (TOC + RAG + marks density + proximity)
-- _BAND_ROW_PATTERNS (drops hallucinated band rows)
-- _salvage_criteria JSON repair
-- _truncate_for_db
+STAGE 3 -- Proposal scoring  (Python formula primary, tiny LLM for fact extraction)
+  For each criterion:
+    A. Detect formula type from criteria_text (STEP / BAND / PER_UNIT / QUAL / LLM)
+    B. Ask a tiny LLM prompt (< 2 000 chars, 60 s timeout) for ONE specific fact.
+       e.g. "What is the average annual turnover in Cr?"
+    C. Apply the Python formula to that fact -- no LLM arithmetic.
+  Scores are strictly grounded in proposal text.  If the fact is not found,
+  score = 0 with a clear gap message.
+
+Files to DELETE (no longer needed):
+  core/tq_step1_extract.py   -- superseded by Stage 1 here
+  core/tq_step2_score.py     -- superseded by Stage 3 here
+  core/llm_client.py         -- SSC1 only; not used by TQ
+  core/extractor_ssc.py      -- SSC1 experiment; not used by TQ
+  core/parser_ssc.py         -- Docling parser is inline here
 """
 
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import re
 import requests
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Optional
@@ -58,7 +59,8 @@ from core.parser import parse_document
 OLLAMA_MODEL     = "llama3.2"
 OLLAMA_HOST      = "http://localhost:11434"
 OLLAMA_CHAT_URL  = f"{OLLAMA_HOST}/api/chat"
-OLLAMA_TIMEOUT   = 600
+OLLAMA_TIMEOUT   = 600          # long timeout for table-extraction fallback
+OLLAMA_TIMEOUT_S = 60           # short timeout for single-fact extraction
 
 TQ_UPLOAD_DIR = Path("./tq_uploads")
 TQ_UPLOAD_DIR.mkdir(exist_ok=True)
@@ -71,10 +73,10 @@ HOT_THRESHOLD        = 7
 
 
 # ---------------------------------------------------------------------------
-# Ollama
+# Ollama helpers
 # ---------------------------------------------------------------------------
 
-def _call_ollama(prompt: str, ctx: int = 8192) -> str:
+def _call_ollama(prompt: str, ctx: int = 8192, timeout: int = OLLAMA_TIMEOUT) -> str:
     try:
         resp = requests.post(
             OLLAMA_CHAT_URL,
@@ -84,13 +86,16 @@ def _call_ollama(prompt: str, ctx: int = 8192) -> str:
                 "stream":   False,
                 "options":  {"temperature": 0.0, "num_ctx": ctx},
             },
-            timeout=OLLAMA_TIMEOUT,
+            timeout=timeout,
         )
         resp.raise_for_status()
         content = resp.json()["message"]["content"]
         if not content:
             print(f"[TQ] Ollama returned empty (ctx={ctx})")
         return content or ""
+    except requests.exceptions.Timeout:
+        print(f"[TQ] Ollama timeout after {timeout}s")
+        return ""
     except Exception as e:
         print(f"[TQ] Ollama error: {e}")
         return ""
@@ -135,33 +140,14 @@ def _clean_json(text: str) -> str:
     return _try_close_json(text)
 
 
-def _salvage_criteria(raw: str) -> list:
-    results, seen = [], set()
-    pat = re.compile(
-        r'\{\s*"item_code"\s*:\s*"([^"]+)"\s*,\s*"parameter"\s*:\s*"([^"]+)"\s*,'
-        r'\s*"max_marks"\s*:\s*(\d+)',
-        re.DOTALL,
-    )
-    for m in pat.finditer(raw):
-        code = m.group(1)
-        if code in seen: continue
-        seen.add(code)
-        start = m.start(); depth = 0; end = start; in_str = esc = False
-        for i, ch in enumerate(raw[start:], start):
-            if esc:           esc = False; continue
-            if ch == "\\" and in_str: esc = True; continue
-            if ch == '"':     in_str = not in_str; continue
-            if in_str:        continue
-            if ch == "{":     depth += 1
-            elif ch == "}":   depth -= 1
-            if depth == 0:    end = i + 1; break
-        snippet = raw[start:end] if end > start else raw[start:]
-        try:
-            results.append(json.loads(snippet))
-        except json.JSONDecodeError:
-            results.append({"item_code": code, "parameter": m.group(2),
-                             "max_marks": int(m.group(3)), "criteria_text": ""})
-    return results
+def _parse_json(text: str) -> Optional[dict]:
+    cleaned = _clean_json(text)
+    if not cleaned:
+        return None
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
 
 
 def _esc(t: str) -> str:
@@ -193,7 +179,7 @@ def _deduplicate(chunks: list) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Signal regexes
+# Signal regexes (page scoring)
 # ---------------------------------------------------------------------------
 
 _MARKS_SIGNAL = re.compile(
@@ -221,57 +207,6 @@ _TOR_ACTION_PREFIXES = re.compile(
     r"ensure\b|review\b|facilitate\b|he\s*/\s*she\b|the\s+consultant\s+shall)",
     re.IGNORECASE,
 )
-_SKIP_ROW_PATTERNS = re.compile(
-    r"(^presentation$|^interview$|viva\b|^demo$|^panel$|financial\s+bid|price\s+bid|"
-    r"\bL1\b|commercial\s+bid|indemnity|arbitration|combined\s+and\s+final|"
-    r"hiring\s+[&and]+\s+implementation|appreciation\s+and\s+response)",
-    re.IGNORECASE,
-)
-_SUBITEM_PATTERNS = re.compile(
-    r"^(team\s+leader|procurement\s+expert|documentation\s+expert|"
-    r"urban\s+planning\s+expert|environmental\s+expert|animal\s+care\s+expert|"
-    r"ict\s*/\s*it|gis\s+expert|data\s+analyst|legal\s+policy|"
-    r"urban\s+finance|finance\s+expert|reporting\s+manager|liaison\s+officer|"
-    r"ppp\s+specialist)",
-    re.IGNORECASE,
-)
-
-# Band threshold rows returned as separate criteria
-_BAND_ROW_PATTERNS = re.compile(
-    r"""(
-        ^single\s+order\s+of\b              |
-        ^for\s+every\s+additional\b         |
-        ^\d+\s+marks?\s+for\b              |
-        ^turnover\s*[-]\s*\d+              |
-        ^order\s+copy\b                     |
-        ^audited\s+balance\b                |
-        ^cvs?\s+of\s+the\b                  |
-        ^only\s+completion\b                |
-        ^\d+\s*cr\.?\s*[=]\s*\d+\s+marks   |
-        ^for\s+minimum\s+\d+\s+projects?   |
-        ^for\s+every\s+additional\s+project
-    )""",
-    re.IGNORECASE | re.VERBOSE,
-)
-
-# FIX BUG A: Parameter names contaminated with Particulars text.
-# Triggered when the name is long AND contains numeric/currency/criteria text.
-_PARTICULARS_IN_PARAM = re.compile(
-    r"""(
-        minimum\s+average         |   # "Minimum Average turnover of..."
-        experience\s+in\s+provid  |   # "Experience in providing..."
-        single\s+order\s+with     |   # "Single order with number..."
-        educational\s+qualif      |   # "Educational Qualification..."
-        \d+\s*cr[s]?\b            |   # "100 Crs", "0.4 Cr"
-        rs\.?\s*\d+               |   # "Rs 0.4"
-        thematic\s+sector         |   # long particulars phrase
-        amrut\s*/\s*pmay          |   # specific scheme names
-        last\s+\d+\s+financial
-    )""",
-    re.IGNORECASE | re.VERBOSE,
-)
-
-# TOC section keywords
 _EVAL_SECTION_KW = re.compile(
     r"(criteria\s+for\s+(technical\s+)?evaluation|evaluation\s+(of\s+)?criteria|"
     r"evaluation\s+of\s+technical\s+bid|technical\s+bid\s+eval(uation)?|scoring\s+criteria)",
@@ -282,7 +217,6 @@ _NEXT_SECTION_KW = re.compile(
     r"combined\s+and\s+final|general\s+conditions|special\s+conditions|fraud\s+and\s+corrupt)",
     re.IGNORECASE,
 )
-
 _TABLE_RAG_QUERIES = [
     "S.No parameter name particulars max marks evaluation criteria table",
     "technical bid evaluation scoring criteria turnover experience qualifications",
@@ -291,7 +225,7 @@ _TABLE_RAG_QUERIES = [
 
 
 # ---------------------------------------------------------------------------
-# TOC parser
+# STAGE 1 -- TOC parser + page scoring (deterministic)
 # ---------------------------------------------------------------------------
 
 def _extract_trailing_page(line: str) -> Optional[int]:
@@ -331,13 +265,9 @@ def _parse_toc(all_chunks: list) -> tuple:
                 print(f"[TQ] TOC: eval section p{start_pg} -> p{end_pg}")
                 return start_pg, end_pg
 
-    print("[TQ] TOC: eval section not found in first 20 pages")
+    print("[TQ] TOC: eval section not found")
     return None, None
 
-
-# ---------------------------------------------------------------------------
-# Page scoring + cluster
-# ---------------------------------------------------------------------------
 
 def _score_pages(all_chunks: list, toc_start: Optional[int],
                  toc_end: Optional[int], rag_pages: set) -> dict:
@@ -435,304 +365,527 @@ def _rag_pages(rfp_doc_name: str) -> set:
     return hit
 
 
-# ---------------------------------------------------------------------------
-# Build context string from cluster
-# ---------------------------------------------------------------------------
-
-def _build_context(rfp_doc_name: str) -> tuple:
+def _find_eval_cluster(rfp_doc_name: str) -> tuple[list, Optional[int], Optional[int]]:
+    """
+    Returns (cluster_pages, toc_start, toc_end).
+    cluster_pages is the list of 0-based page INDICES for fitz.
+    """
     all_chunks = _deduplicate(get_all_chunks_for_doc(rfp_doc_name))
     if not all_chunks:
-        return "", "empty store"
+        return [], None, None
 
     toc_start, toc_end = _parse_toc(all_chunks)
     rag                = _rag_pages(rfp_doc_name)
     print(f"[TQ] RAG hit pages: {sorted(rag)}")
 
-    scores = _score_pages(all_chunks, toc_start, toc_end, rag)
-    top    = sorted([(pg, sc, rs) for pg, (sc, rs) in scores.items() if sc > 0],
-                    key=lambda x: -x[1])[:15]
-    print(f"[TQ] Top page scores:")
+    scores  = _score_pages(all_chunks, toc_start, toc_end, rag)
+    top     = sorted([(pg, sc, rs) for pg, (sc, rs) in scores.items() if sc > 0],
+                     key=lambda x: -x[1])[:15]
+    print("[TQ] Top page scores:")
     for pg, sc, rs in top:
         print(f"     p{pg:3d}  score={sc:5.1f}  [{', '.join(rs)}]")
 
     cluster = _best_cluster(scores, toc_start)
-    if not cluster:
-        print("[TQ] No cluster -- using any marks-containing chunks")
-        section_chunks = [c for c in all_chunks if _MARKS_SIGNAL.search(c.get("text", ""))]
-        source = "fallback-marks-scan"
+    if cluster:
+        print(f"[TQ] Cluster: {cluster}")
     else:
-        page_set       = set(cluster)
-        section_chunks = [c for c in all_chunks if c.get("page_no", 0) in page_set]
-        source = f"cluster p{cluster[0]}-p{cluster[-1]}"
-        print(f"[TQ] Cluster: {cluster} ({len(section_chunks)} chunks)")
+        print("[TQ] No cluster found")
 
-    parts, total = [], 0
-    for c in sorted(section_chunks, key=lambda x: x.get("page_no", 0)):
-        block = (f"[Page {c.get('page_no', 0)} | {c.get('section_heading', '')}]\n"
-                 f"{c.get('text', '')}")
-        if total + len(block) > MAX_CONTEXT_CHARS:
-            break
-        parts.append(block); total += len(block)
-
-    context = "\n\n---\n\n".join(parts)
-    print(f"[TQ] Context: {len(parts)} chunks, {total} chars  ({source})")
-    return context, source
+    return cluster, toc_start, toc_end
 
 
 # ---------------------------------------------------------------------------
-# LLM prompt
+# STAGE 2A -- Docling table extraction (primary)
+# ---------------------------------------------------------------------------
+
+def _extract_pages_as_pdf(pdf_path: str, page_numbers_1based: list) -> Optional[bytes]:
+    """
+    Extract specific pages from a PDF into a new in-memory PDF.
+    page_numbers_1based: list of 1-based page numbers (as stored in chunks).
+    Returns raw bytes of the new PDF, or None on failure.
+    """
+    try:
+        import fitz
+        src = fitz.open(pdf_path)
+        dst = fitz.open()
+        for pg_1 in page_numbers_1based:
+            idx = pg_1 - 1   # fitz is 0-based
+            if 0 <= idx < len(src):
+                dst.insert_pdf(src, from_page=idx, to_page=idx)
+        data = dst.tobytes()
+        src.close(); dst.close()
+        return data
+    except Exception as e:
+        print(f"[TQ] PDF page extraction failed: {e}")
+        return None
+
+
+def _docling_extract_tables(pdf_bytes: bytes) -> list:
+    """
+    Run Docling on a PDF (as bytes) and return list of TableInfo dicts:
+      { page_no, dataframe, markdown }
+    Returns [] if Docling is not installed or fails.
+    """
+    try:
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
+        import pandas as pd
+    except ImportError:
+        print("[TQ] Docling not installed -- run: pip install docling")
+        return []
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(pdf_bytes)
+            tmp_path = f.name
+
+        opts = PdfPipelineOptions()
+        opts.do_table_structure = True
+        opts.do_ocr             = False
+        opts.table_structure_options.do_cell_matching = True
+        opts.table_structure_options.mode = TableFormerMode.FAST
+
+        conv   = DocumentConverter(
+            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
+        )
+        result = conv.convert(tmp_path)
+        doc    = result.document
+
+        tables = []
+        for tbl in doc.tables:
+            page_no = (tbl.prov[0].page_no if getattr(tbl, "prov", None) else 0)
+            try:
+                df = tbl.export_to_dataframe(doc)
+            except Exception:
+                df = pd.DataFrame()
+            try:
+                md = tbl.export_to_markdown(doc)
+            except Exception:
+                md = df.to_string() if not df.empty else ""
+
+            if not df.empty and len(df) >= 2:
+                tables.append({"page_no": page_no, "dataframe": df, "markdown": md})
+
+        Path(tmp_path).unlink(missing_ok=True)
+        print(f"[TQ] Docling: found {len(tables)} tables in eval page cluster")
+        return tables
+
+    except Exception as e:
+        print(f"[TQ] Docling extraction failed: {e}")
+        try: Path(tmp_path).unlink(missing_ok=True)
+        except Exception: pass
+        return []
+
+
+# ---------------------------------------------------------------------------
+# STAGE 2B -- DataFrame -> criterion dicts (deterministic parser)
+# ---------------------------------------------------------------------------
+
+_SKIP_ROW_PATTERNS = re.compile(
+    r"""(
+        ^presentation$          |
+        ^interview$             |
+        viva\b                  |
+        ^demo$                  |
+        ^panel$                 |
+        financial\s+bid         |
+        price\s+bid             |
+        \bL1\b                  |
+        commercial\s+bid        |
+        indemnity               |
+        arbitration             |
+        combined\s+and\s+final  |
+        hiring\s+[&and]+\s+implementation |
+        appreciation\s+and\s+response     |
+        opening\s+of.*financial           |
+        evaluation\s+of\s+financial
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_SUBITEM_PATTERNS = re.compile(
+    r"^(team\s+leader|procurement\s+expert|documentation\s+expert|"
+    r"urban\s+planning\s+expert|environmental\s+expert|animal\s+care\s+expert|"
+    r"ict\s*/\s*it|gis\s+expert|data\s+analyst|legal\s+policy|"
+    r"urban\s+finance|finance\s+expert|reporting\s+manager|liaison\s+officer|"
+    r"ppp\s+specialist)",
+    re.IGNORECASE,
+)
+
+_BAND_ROW_PATTERNS = re.compile(
+    r"""(
+        ^single\s+order\s+of\b      |
+        ^for\s+every\s+additional\b |
+        ^\d+\s+marks?\s+for\b       |
+        ^order\s+copy\b             |
+        ^audited\s+balance\b        |
+        ^cvs?\s+of\s+the\b          |
+        ^only\s+completion\b        |
+        ^for\s+minimum\s+\d+\s+projects? |
+        ^for\s+every\s+additional\s+project
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _find_column(df, keywords: list) -> Optional[int]:
+    """Find the column index whose header best matches any keyword."""
+    import pandas as pd
+    for ki, kw in enumerate(keywords):
+        for ci, col in enumerate(df.columns):
+            if kw.lower() in str(col).lower():
+                return ci
+    # Also check first row as header
+    if len(df) > 0:
+        for ci, val in enumerate(df.iloc[0]):
+            for kw in keywords:
+                if kw.lower() in str(val).lower():
+                    return ci
+    return None
+
+
+def _extract_max_marks_from_cell(cell_text: str) -> Optional[int]:
+    """
+    Extract the integer from the Max. Marks cell.
+    Handles OCR artefacts: "15 mark s", "15\nmarks", plain "15".
+    Strictly 1-60 range.
+    """
+    text = str(cell_text).strip()
+    # Remove "marks" and variants to get the bare number
+    cleaned = re.sub(r"mark\s*s?\b", "", text, flags=re.IGNORECASE).strip()
+    # Find all integers in 1-60 range
+    candidates = [int(m) for m in re.findall(r"\b(\d{1,2})\b", cleaned)
+                  if 1 <= int(m) <= 60]
+    if candidates:
+        # Return the largest (most likely the actual max marks, not a sub-band)
+        return max(candidates)
+    return None
+
+
+def _is_sno_cell(cell_text: str) -> bool:
+    """True if this cell looks like a row number (1-20)."""
+    t = str(cell_text).strip().rstrip(".")
+    return bool(re.match(r"^\d{1,2}$", t)) and 1 <= int(t) <= 20
+
+
+def _parse_dataframe_to_criteria(df, table_markdown: str = "") -> list:
+    """
+    Parse a Docling-extracted DataFrame into criterion dicts.
+    Handles multi-row cells (Docling merges them) and OCR artefacts.
+    Returns list of {item_code, parameter, max_marks, criteria_text}.
+    """
+    import pandas as pd
+
+    # Normalise: stringify everything
+    df = df.fillna("").astype(str)
+
+    rows   = df.values.tolist()
+    n_cols = df.shape[1]
+
+    if n_cols < 3:
+        print(f"[TQ] DataFrame too narrow ({n_cols} cols) -- skipping")
+        return []
+
+    # Heuristic column identification
+    # Try to find S.No, Parameter, Criteria, Max.Marks columns by scanning
+    # the first few rows for header-like content
+
+    sno_col    = None
+    param_col  = None
+    crit_col   = None
+    marks_col  = None
+
+    # Scan first 4 rows as potential headers
+    for row in rows[:4]:
+        for ci, val in enumerate(row):
+            v = str(val).lower().strip()
+            if re.match(r"s\.?\s*no\.?|serial", v) and sno_col is None:
+                sno_col = ci
+            if re.match(r"param(eter)?(\s+name)?|criterion", v) and param_col is None:
+                param_col = ci
+            if re.match(r"particular|criteria|description", v) and crit_col is None:
+                crit_col = ci
+            if re.match(r"max|marks?|full\s+marks?", v) and marks_col is None:
+                marks_col = ci
+
+    # If column detection failed, apply positional heuristic for 5-col table
+    if sno_col is None:
+        sno_col = 0
+    if param_col is None:
+        param_col = 1
+    if crit_col is None:
+        crit_col = 2 if n_cols >= 4 else 1
+    if marks_col is None:
+        # Rightmost numeric-looking column
+        marks_col = n_cols - 2 if n_cols >= 4 else n_cols - 1
+
+    print(f"[TQ] DataFrame cols: sno={sno_col} param={param_col} "
+          f"crit={crit_col} marks={marks_col}  (total={n_cols})")
+
+    # Merge multi-row cells: group rows by the S.No anchor
+    # A row belongs to criterion N if its sno cell is N or is blank
+    criteria_raw: list[dict] = []
+    current: Optional[dict]  = None
+
+    for row in rows:
+        sno_val    = str(row[sno_col]).strip().rstrip(".")
+        param_val  = str(row[param_col]).strip()
+        crit_val   = str(row[crit_col]).strip() if crit_col < len(row) else ""
+        marks_val  = str(row[marks_col]).strip() if marks_col < len(row) else ""
+
+        if _is_sno_cell(sno_val):
+            # Start new criterion
+            if current:
+                criteria_raw.append(current)
+            current = {
+                "item_code":     sno_val,
+                "parameter":     param_val,
+                "criteria_text": crit_val,
+                "marks_raw":     marks_val,
+            }
+        elif current is not None:
+            # Continuation row -- append to current criterion
+            if param_val and param_val not in current["parameter"]:
+                current["parameter"]     += (" " + param_val).rstrip()
+            if crit_val:
+                current["criteria_text"] += (" " + crit_val)
+            if marks_val and not current["marks_raw"]:
+                current["marks_raw"]      = marks_val
+            elif marks_val and current["marks_raw"] != marks_val:
+                # Keep the first non-empty value that looks like a max mark
+                if not re.search(r"\b\d{1,2}\b", current["marks_raw"]):
+                    current["marks_raw"] = marks_val
+
+    if current:
+        criteria_raw.append(current)
+
+    # Convert to validated criterion dicts
+    criteria = []
+    for c in criteria_raw:
+        name  = re.sub(r"\s+", " ", c.get("parameter", "")).strip()
+        ctext = re.sub(r"\s+", " ", c.get("criteria_text", "")).strip()
+        marks = _extract_max_marks_from_cell(c.get("marks_raw", ""))
+        code  = c.get("item_code", "")
+
+        if not name or marks is None or marks < 1:
+            continue
+        if marks > 60:
+            print(f"[TQ] Docling: dropped (marks={marks} > 60): {name[:60]}")
+            continue
+        if _SKIP_ROW_PATTERNS.search(name):
+            print(f"[TQ] Docling: dropped (skip): {name[:60]}")
+            continue
+        if _SUBITEM_PATTERNS.match(name):
+            print(f"[TQ] Docling: dropped (sub-item): {name[:60]}")
+            continue
+        if _BAND_ROW_PATTERNS.search(name):
+            print(f"[TQ] Docling: dropped (band row): {name[:60]}")
+            continue
+
+        criteria.append({
+            "item_code":     code,
+            "parameter":     name,
+            "max_marks":     marks,
+            "criteria_text": ctext,
+        })
+
+    return criteria
+
+
+def _select_best_table(tables: list) -> list:
+    """
+    From multiple Docling tables, pick the one most likely to be the scoring table.
+    Heuristic: table that has the most rows with S.No-looking cells AND marks-looking cells.
+    """
+    best_score = -1
+    best_crit  = []
+
+    for tbl in tables:
+        df   = tbl.get("dataframe")
+        crit = _parse_dataframe_to_criteria(df, tbl.get("markdown", ""))
+        doc_max = sum(c["max_marks"] for c in crit)
+        # Score: number of valid criteria weighted by doc_max proximity to 100
+        tbl_score = len(crit) * 10 + min(doc_max, 100)
+        print(f"[TQ] Docling table: {len(crit)} valid criteria, doc_max={doc_max}, "
+              f"tbl_score={tbl_score}")
+        if tbl_score > best_score:
+            best_score = tbl_score
+            best_crit  = crit
+
+    return best_crit
+
+
+# ---------------------------------------------------------------------------
+# STAGE 2C -- LLM fallback (only if Docling fails or yields nothing)
 # ---------------------------------------------------------------------------
 
 _TABLE_PROMPT = """\
-You are reading pages from an Indian government RFP (Request for Proposal).
+You are reading pages from an Indian government RFP.
 Extract ONLY the Technical Bid Evaluation scoring table.
 
 TABLE STRUCTURE (columns left to right):
   S.No | Parameter Name | Particulars / Criteria | Max. Marks | Document required
 
-═══ CRITICAL RULES ═══════════════════════════════════════════════════════════
-
-RULE 1 -- ONE ROW PER S.No ONLY
-  Count the S.No column values you can see (1, 2, 3, 4, 5...).
-  Extract EXACTLY that many rows -- no more, no fewer.
-  Do NOT invent rows. Do NOT split one S.No row into multiple rows.
-
-RULE 2 -- MAX. MARKS comes from the rightmost integer column, NOT from
-  the Particulars cell.
-
-  WRONG EXAMPLE (do not do this):
-    S.No=1, Parameter="Turnover", Particulars="100 Cr = 5 marks, +0.5 per 10 Cr",
-    Max. Marks column = 15
-    WRONG: create extra row with max_marks=5
-    RIGHT: one row, max_marks=15, criteria_text contains the full band text
-
-  WRONG EXAMPLE (do not do this):
-    S.No=2, Parameter="Past Experience A",
-    Particulars="Single order of 06 professionals: 10 marks
-                 Single order of 07-12 professionals: 15 marks
-                 Single order of >12 professionals: 20 marks",
-    Max. Marks column = 20
-    WRONG: create 3 rows with max_marks=10, 15, 20
-    RIGHT: one row, max_marks=20, criteria_text contains all three band lines
-
-RULE 3 -- Parameter Name must be SHORT (the leftmost column label only)
-  The Parameter Name column contains a SHORT label such as:
-    "Turnover", "Past Experience A", "Past Experience B",
-    "Qualifications and competence of staff members proposed by the bidder"
-  It does NOT contain the Particulars text.
-  If you find yourself writing "Turnover Minimum Average turnover of 100 Crs..."
-  as a parameter, STOP -- that is the Particulars column text leaking in.
-  Use only the short label from the Parameter Name column.
-
-RULE 4 -- Qualifications row with nested expert sub-table
-  Row 4 typically contains a sub-table of expert roles inside the Particulars cell:
-    Team Leader: 3 marks, Procurement Expert: 2 marks, GIS Expert: 2 marks, etc.
-  This is ONE row. Max. Marks for this row is the value in the Max. Marks column
-  (commonly 20 or 25), NOT the individual expert sub-marks.
-  Put ALL expert role text inside criteria_text. Do NOT create separate rows.
-
-RULE 5 -- Repeated table headers
-  The header row repeats at the top of each page. Ignore all repeated headers.
-
-RULE 6 -- Rows to SKIP (add to skipped_rows, do NOT include in criteria)
-  - Presentation / Interview / Viva / Demo / Panel  (live assessment)
-  - Financial Bid / Price Bid / L1 / Quoted Rate
-  - Contract clauses: Indemnity, Arbitration, Termination, Force Majeure
-  - ToR action sentences: "Assist...", "Monitor...", "Prepare..."
-
-RULE 7 -- Verbatim copy
-  Copy the short Parameter Name and the full Particulars/Criteria text verbatim.
-  Include ALL band/threshold text in criteria_text.
-
-══════════════════════════════════════════════════════════════════════════════
+CRITICAL RULES:
+1. ONE row per S.No only. Count S.No values (1,2,3,...) and extract EXACTLY that many rows.
+2. Max. Marks is from the rightmost integer column ONLY -- not from band text inside Particulars.
+   Example: "Single order of 06 professionals: 10 marks | 07-12: 15 marks | >12: 20 marks | MAX 20"
+   Correct: max_marks=20 (from Max. Marks column). Wrong: create 3 rows with 10/15/20.
+3. Parameter Name is SHORT (the leftmost label column). Do NOT put Particulars text in parameter.
+4. Qualifications row = ONE row with the expert sub-table inside criteria_text.
+5. Skip: Presentation / Financial Bid / Contract clauses.
 
 RFP PAGES:
 {context}
 
-Return ONLY valid JSON -- no preamble, no markdown fences, nothing else:
+Return ONLY valid JSON:
 {{
-  "evaluation_title": "exact title of this section from the RFP",
-  "grand_total_marks": <integer -- sum of ALL rows including skipped, or 0 if unclear>,
+  "evaluation_title": "section title",
+  "grand_total_marks": <integer>,
   "qualification_threshold_pct": <number or null>,
-  "visible_sno_values": [<list of S.No integers visible, e.g. 1,2,3,4,5>],
-  "skipped_rows": ["row name -- reason"],
+  "visible_sno_values": [1,2,3,4,5],
+  "skipped_rows": ["name -- reason"],
   "criteria": [
     {{
-      "item_code": "<S.No as string>",
-      "parameter": "<SHORT Parameter Name from leftmost column only>",
-      "max_marks": <integer from the rightmost Max. Marks column ONLY>,
-      "criteria_text": "<VERBATIM full Particulars/Criteria cell including all bands>"
+      "item_code": "<S.No>",
+      "parameter": "<SHORT Parameter Name>",
+      "max_marks": <integer from Max. Marks column>,
+      "criteria_text": "<VERBATIM full Particulars/Criteria>"
     }}
   ]
 }}
 """
 
 
-# ---------------------------------------------------------------------------
-# Validation + post-processing
-# ---------------------------------------------------------------------------
+def _llm_extract_from_context(context: str) -> list:
+    """LLM fallback: extract criteria from raw text context."""
+    prompt = _TABLE_PROMPT.format(context=_esc(context))
+    print(f"[TQ] LLM fallback: sending {len(prompt)} chars (ctx=32768)")
 
-def _validate(c: dict) -> bool:
-    name = (c.get("parameter") or "").strip()
-    try:
+    raw = _call_ollama(prompt, ctx=32768, timeout=OLLAMA_TIMEOUT)
+    if not raw.strip():
+        return []
+
+    data = _parse_json(raw)
+    if not data:
+        return []
+
+    visible_sno = data.get("visible_sno_values", [])
+    raw_crit    = data.get("criteria", [])
+    valid       = []
+
+    for c in raw_crit:
+        name  = (c.get("parameter") or "").strip()
         marks = int(c.get("max_marks") or 0)
-    except (TypeError, ValueError):
-        return False
+        if not name or marks < 1 or marks > 60:
+            continue
+        if _SKIP_ROW_PATTERNS.search(name):
+            print(f"[TQ] LLM-fallback: dropped (skip): {name[:60]}"); continue
+        if _SUBITEM_PATTERNS.match(name):
+            print(f"[TQ] LLM-fallback: dropped (sub-item): {name[:60]}"); continue
+        if _BAND_ROW_PATTERNS.search(name):
+            print(f"[TQ] LLM-fallback: dropped (band): {name[:60]}"); continue
+        valid.append({
+            "item_code":     c.get("item_code", ""),
+            "parameter":     name,
+            "max_marks":     marks,
+            "criteria_text": (c.get("criteria_text") or "").strip(),
+        })
 
-    if not name or marks < 1 or marks > 100:
-        return False
+    if visible_sno and len(valid) > len(visible_sno):
+        print(f"[TQ] LLM-fallback WARNING: {len(valid)} criteria > "
+              f"{len(visible_sno)} visible rows -- possible hallucination")
 
-    # FIX BUG A: parameter name contaminated with Particulars text
-    if len(name) > 60 and _PARTICULARS_IN_PARAM.search(name):
-        print(f"[TQ] Dropped (contaminated param): {name[:80]}"); return False
-
-    if _BAND_ROW_PATTERNS.search(name):
-        print(f"[TQ] Dropped (band row): {name[:80]}"); return False
-
-    if _SKIP_ROW_PATTERNS.search(name):
-        print(f"[TQ] Dropped (skip): {name[:80]}"); return False
-
-    if _SUBITEM_PATTERNS.match(name):
-        print(f"[TQ] Dropped (sub-item): {name[:80]}"); return False
-
-    if _TOR_ACTION_PREFIXES.match(name):
-        print(f"[TQ] Dropped (ToR action): {name[:80]}"); return False
-
-    return True
+    return valid
 
 
-def _normalised_prefix(name: str, words: int = 3) -> str:
-    """First N words of normalised name, used for duplicate-by-prefix detection."""
-    tokens = re.sub(r"\s+", " ", name).strip().lower().split()
-    return " ".join(tokens[:words])
+def _build_text_context(all_chunks: list, cluster: list) -> str:
+    """Build raw text context from cluster pages (for LLM fallback)."""
+    page_set = set(cluster)
+    chunks   = [c for c in all_chunks if c.get("page_no", 0) in page_set]
+    parts, total = [], 0
+    for c in sorted(chunks, key=lambda x: x.get("page_no", 0)):
+        block = (f"[Page {c.get('page_no', 0)} | {c.get('section_heading', '')}]\n"
+                 f"{c.get('text', '')}")
+        if total + len(block) > MAX_CONTEXT_CHARS:
+            break
+        parts.append(block); total += len(block)
+    return "\n\n---\n\n".join(parts)
 
 
-def _dedup(criteria: list) -> list:
-    """Standard dedup by (normalised name, marks)."""
+# ---------------------------------------------------------------------------
+# Main table extraction entry point
+# ---------------------------------------------------------------------------
+
+def _dedup_criteria(criteria: list) -> list:
+    """Keep longest criteria_text for each (normalised_name, marks) pair."""
     seen: dict = {}
     for c in criteria:
         key = (re.sub(r"\s+", " ", c.get("parameter", "")).strip().lower(),
                int(c.get("max_marks") or 0))
-        if key not in seen or (len(c.get("criteria_text", "")) >
-                                len(seen[key].get("criteria_text", ""))):
+        if key not in seen or len(c.get("criteria_text", "")) > len(seen[key].get("criteria_text", "")):
             seen[key] = c
     return list(seen.values())
 
 
-def _dedup_by_prefix(criteria: list) -> list:
-    """
-    FIX BUG A (part 2): if two criteria share the same 3-word prefix (e.g.
-    'Turnover' and 'Turnover Minimum Average...'), keep only the one with the
-    higher max_marks (the real row, not the contaminated duplicate).
-    """
-    prefix_map: dict = {}
-    for c in criteria:
-        pfx = _normalised_prefix(c.get("parameter", ""))
-        if pfx not in prefix_map:
-            prefix_map[pfx] = c
-        else:
-            existing = prefix_map[pfx]
-            # Keep the one with higher marks (more likely to be the real row)
-            # or, if marks equal, shorter name (less contaminated)
-            if (int(c.get("max_marks") or 0) > int(existing.get("max_marks") or 0) or
-                    (int(c.get("max_marks") or 0) == int(existing.get("max_marks") or 0)
-                     and len(c.get("parameter", "")) < len(existing.get("parameter", "")))):
-                prefix_map[pfx] = c
-                print(f"[TQ] Prefix-dedup: kept '{c['parameter'][:50]}' "
-                      f"over '{existing['parameter'][:50]}'")
-            else:
-                print(f"[TQ] Prefix-dedup: dropped '{c['parameter'][:50]}'")
-    return list(prefix_map.values())
-
-
-# ---------------------------------------------------------------------------
-# Main extraction
-# ---------------------------------------------------------------------------
-
 def extract_marking_table(rfp_doc_name: str) -> dict:
+    """
+    Full Stage 1 + Stage 2 pipeline.
+    Returns the standard table dict used by the orchestrator.
+    """
     print(f"[TQ] Extracting marking table from: {rfp_doc_name}")
 
-    context, source = _build_context(rfp_doc_name)
-    if not context.strip():
-        return {"criteria": [], "grand_total_marks": 0,
-                "error": "No document content found.", "context_source": source}
+    # Stage 1: find eval page cluster
+    all_chunks   = _deduplicate(get_all_chunks_for_doc(rfp_doc_name))
+    cluster, toc_start, toc_end = _find_eval_cluster(rfp_doc_name)
 
-    prompt = _TABLE_PROMPT.format(context=_esc(context))
-    print(f"[TQ] Sending {len(prompt)} chars to LLM (ctx=32768)")
+    criteria: list = []
+    source         = "unknown"
 
-    raw = _call_ollama(prompt, ctx=32768)
-    if not raw.strip():
-        return {"criteria": [], "grand_total_marks": 0,
-                "error": "LLM returned empty.", "context_source": source}
+    # Stage 2A: Docling (preferred)
+    pdf_path = Path("./uploads") / rfp_doc_name
+    if cluster and pdf_path.exists():
+        pdf_bytes = _extract_pages_as_pdf(str(pdf_path), cluster)
+        if pdf_bytes:
+            tables   = _docling_extract_tables(pdf_bytes)
+            criteria = _select_best_table(tables)
+            if criteria:
+                source = f"Docling (cluster p{cluster[0]}-p{cluster[-1]})"
+                print(f"[TQ] Docling: extracted {len(criteria)} criteria")
 
-    # Parse JSON with salvage fallback
-    table: Optional[dict] = None
-    try:
-        table = json.loads(_clean_json(raw))
-    except json.JSONDecodeError as e:
-        print(f"[TQ] JSON parse error: {e} -- attempting salvage")
-        salvaged = _salvage_criteria(raw)
-        if salvaged:
-            gt_m = re.search(r'"grand_total_marks"\s*:\s*(\d+)', raw)
-            qt_m = re.search(r'"qualification_threshold_pct"\s*:\s*(\d+(?:\.\d+)?)', raw)
-            et_m = re.search(r'"evaluation_title"\s*:\s*"([^"]+)"', raw)
-            table = {
-                "evaluation_title": et_m.group(1) if et_m else "Technical Evaluation",
-                "grand_total_marks": int(gt_m.group(1)) if gt_m else 0,
-                "qualification_threshold_pct": float(qt_m.group(1)) if qt_m else None,
-                "criteria": salvaged,
-            }
-            print(f"[TQ] Salvaged {len(salvaged)} criteria")
-        else:
-            return {"criteria": [], "grand_total_marks": 0,
-                    "error": f"JSON parse failed: {e}", "context_source": source}
-
-    visible_sno = table.get("visible_sno_values", [])
-    if visible_sno:
-        print(f"[TQ] LLM visible S.No values: {visible_sno}")
-
-    raw_criteria = table.get("criteria", [])
-    valid        = [c for c in raw_criteria if _validate(c)]
-    dropped      = len(raw_criteria) - len(valid)
-    if dropped:
-        print(f"[TQ] Dropped {dropped} invalid rows")
-
-    # Apply both dedup passes
-    criteria = _dedup_by_prefix(_dedup(valid))
-
-    # Hallucination guard
-    if visible_sno and len(criteria) > len(visible_sno):
-        print(f"[TQ] WARNING: {len(criteria)} criteria but only "
-              f"{len(visible_sno)} S.No values visible -- possible hallucination")
-
-    if table.get("skipped_rows"):
-        print(f"[TQ] LLM skipped: {table['skipped_rows']}")
+    # Stage 2B: LLM fallback
+    if not criteria:
+        print("[TQ] Falling back to LLM extraction")
+        effective_cluster = cluster or list(range(
+            max(1, (toc_start or 40)),
+            (toc_end or (toc_start or 40) + 6) + 1
+        ))
+        context  = _build_text_context(all_chunks, effective_cluster)
+        criteria = _llm_extract_from_context(context)
+        source   = f"LLM-fallback (cluster p{effective_cluster[0] if effective_cluster else '?'})"
 
     if not criteria:
-        return {"criteria": [], "grand_total_marks": table.get("grand_total_marks", 0),
-                "error": "No valid scoring criteria found.", "context_source": source}
+        return {"criteria": [], "grand_total_marks": 0,
+                "error": "No criteria extracted.", "context_source": source}
 
-    doc_max     = sum(int(c.get("max_marks") or 0) for c in criteria)
-    grand_total = int(table.get("grand_total_marks") or 0)
+    criteria    = _dedup_criteria(criteria)
+    doc_max     = sum(c["max_marks"] for c in criteria)
+    grand_total = doc_max   # will be overridden if LLM returned it
 
     schema_warning = None
-    if grand_total > 0 and doc_max > grand_total + 5:
-        schema_warning = (f"Criteria sum to {doc_max} but RFP declares {grand_total} "
-                          "-- check for duplicate rows.")
-    elif grand_total > 0 and doc_max < grand_total * 0.20:
-        schema_warning = (f"Only {doc_max}/{grand_total} marks extracted "
-                          "-- likely missed rows.")
+    if doc_max < 20:
+        schema_warning = f"Only {doc_max} marks extracted -- likely missed rows."
 
-    print(f"[TQ] Extracted {len(criteria)} criteria | "
-          f"doc_max={doc_max} | grand_total={grand_total}")
+    print(f"[TQ] Final: {len(criteria)} criteria | doc_max={doc_max}")
     for c in criteria:
-        print(f"  [{str(c.get('item_code', '?')):3s}] "
+        print(f"  [{str(c.get('item_code','?')):3s}] "
               f"{c['parameter'][:55]:55s}  {c['max_marks']:3d} marks")
 
     return {
-        "evaluation_title":            table.get("evaluation_title", "Technical Evaluation"),
+        "evaluation_title":            "Technical Evaluation",
         "grand_total_marks":           grand_total,
-        "qualification_threshold_pct": table.get("qualification_threshold_pct"),
+        "qualification_threshold_pct": 70.0,
         "criteria":                    criteria,
         "doc_max":                     doc_max,
         "schema_warning":              schema_warning,
@@ -742,152 +895,394 @@ def extract_marking_table(rfp_doc_name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Proposal scoring
+# STAGE 3 -- Strict proposal scoring
 # ---------------------------------------------------------------------------
 
-_SCORE_PROMPT = """\
-You are evaluating a vendor proposal against one RFP scoring criterion.
+# -- Formula detection -------------------------------------------------------
 
-CRITERION: {parameter}
-MAX MARKS: {max_marks}
+def _detect_formula(parameter: str, criteria_text: str) -> str:
+    ct = criteria_text.lower()
+    p  = parameter.lower()
 
-SCORING RULE (verbatim from RFP):
-{criteria_text}
-
-PROPOSAL EXCERPTS:
-{proposal_context}
-
-INSTRUCTIONS:
-1. Identify the exact fact needed (e.g. average turnover, number of professionals
-   in a single order, completed project count).
-2. Find that fact in the proposal excerpts. Note the page if visible.
-3. Apply the scoring rule arithmetically -- show every step.
-4. Award marks generously if the proposal reasonably satisfies the rule.
-5. If the fact is absent, score = 0.
-
-HARD RULES:
-- score must be 0 to {max_marks} inclusive.
-- Use ONLY the proposal text above. No outside knowledge.
-
-Return ONLY valid JSON -- no preamble, no markdown:
-{{
-  "extracted_value": "key fact found, e.g. Avg turnover INR 180 Cr (Page 4), or null",
-  "source_page":     <integer or null>,
-  "scoring_steps":   "step-by-step arithmetic",
-  "score":           <number 0 to {max_marks}>,
-  "justification":   "one sentence citing page/section",
-  "strengths":       ["strength 1"],
-  "gaps":            ["gap if any"],
-  "evidence_found":  true or false
-}}
-"""
+    if re.search(r"every\s+additional\s+\d+\s*cr", ct, re.I):
+        return "STEP"
+    if len(re.findall(r"\d+\s*professional", ct, re.I)) >= 2:
+        return "BAND"
+    if re.search(r"\d+\s*marks?\s+for\s+(?:\d+|each|01|per)\s+(?:project|assignment)", ct, re.I):
+        return "PER_UNIT"
+    if re.search(r"(\d+%.*?(?:education|experience|project|qualification))", ct, re.I):
+        return "QUAL"
+    if "qualification" in p and ("competence" in p or "staff" in p):
+        return "QUAL"
+    return "LLM"
 
 
-def _get_proposal_context(criterion: dict, proposal_doc_name: str,
-                           max_chunks: int = 20, max_chars: int = 12_000) -> str:
-    param    = criterion.get("parameter", "")
-    ctext    = criterion.get("criteria_text", "")
-    combined = (param + " " + ctext).lower()
+# -- Proposal page retrieval (keyword-scored, no ChromaDB) --------------------
 
-    queries = [param]
-    if any(w in combined for w in ["turnover", "revenue", "billing",
-                                    "annual", "crore", "financial year"]):
-        queries += ["annual turnover crore financial year audited balance sheet",
-                    "average annual turnover revenue billing three years"]
-    if any(w in combined for w in ["professional", "manpower", "supply",
-                                    "deputed", "deployed", "number of"]):
-        queries += ["professionals supplied deployed single order government advisory",
-                    "number of professionals manpower order consulting staffing"]
-    if any(w in combined for w in ["experience", "assignment", "project", "urban", "pmc",
-                                    "pmay", "smart", "sbm", "consulting", "ulb"]):
-        queries += ["completed assignments list eligible experience certificate",
-                    "past experience government urban development PMC consulting ULB",
-                    "assignment completion certificate project value billing"]
-    if any(w in combined for w in ["team", "personnel", "expert", "leader",
-                                    "qualification", "competence", "cv",
-                                    "curriculum", "staff", "proposed"]):
-        queries += ["curriculum vitae CVs team leader qualifications years experience",
-                    "key personnel experts proposed educational qualification",
-                    "staff members competence projects undertaken relevant experience"]
+_KW_SETS = {
+    "turnover":      ["turnover", "crore", "annual", "revenue", "balance sheet",
+                      "financial year", "average annual"],
+    "professionals": ["professional", "manpower", "order", "employees", "advisory",
+                      "consulting", "supply", "deployed", "staffing"],
+    "projects":      ["project", "assignment", "pmc", "pmu", "urban", "amrut",
+                      "smart city", "completion certificate", "ulb", "billing"],
+    "qualification": ["cv", "curriculum vitae", "qualification", "years of experience",
+                      "team leader", "expert", "education", "degree", "relevant experience"],
+    "methodology":   ["methodology", "approach", "work plan", "implementation", "strategy"],
+    "generic":       ["experience", "project", "relevant", "work", "assignment"],
+}
 
-    seen, chunks = set(), []
-    for q in list(dict.fromkeys(queries))[:8]:
-        try:
-            for c in retrieve(q, doc_name=proposal_doc_name, top_k=6):
-                cid = str(c.get("page_no", 0)) + c.get("clause_ref", "")[:15]
-                if cid not in seen and c.get("score", 0) > 0.05:
-                    seen.add(cid); chunks.append(c)
-        except Exception:
-            pass
 
-    if len(chunks) < 6:
-        for c in _deduplicate(get_all_chunks_for_doc(proposal_doc_name)):
-            cid = str(c.get("page_no", 0)) + c.get("clause_ref", "")[:15]
-            if cid not in seen:
-                seen.add(cid); chunks.append(c)
+def _pick_kw_set(parameter: str, criteria_text: str) -> list:
+    combined = (parameter + " " + criteria_text).lower()
+    if any(w in combined for w in ["turnover", "crore", "annual"]):
+        return _KW_SETS["turnover"]
+    if any(w in combined for w in ["professional", "manpower", "employees in supply"]):
+        return _KW_SETS["professionals"]
+    if any(w in combined for w in ["pmc", "pmu", "urban", "amrut", "billing", "consulting"]):
+        return _KW_SETS["projects"]
+    if any(w in combined for w in ["qualification", "competence", "cv", "staff"]):
+        return _KW_SETS["qualification"]
+    if any(w in combined for w in ["methodology", "approach", "work plan"]):
+        return _KW_SETS["methodology"]
+    return _KW_SETS["generic"]
 
-    chunks.sort(key=lambda x: x.get("page_no", 0))
+
+def _get_proposal_pages(proposal_path: str, parameter: str,
+                        criteria_text: str, max_chars: int = 2_500) -> str:
+    """Open proposal PDF directly with fitz; score pages by keyword hits."""
+    try:
+        import fitz
+    except ImportError:
+        return ""
+
+    kws    = _pick_kw_set(parameter, criteria_text)
+    doc    = fitz.open(proposal_path)
+    scored = []
+    for pno in range(len(doc)):
+        txt  = doc[pno].get_text()
+        low  = txt.lower()
+        hits = sum(1 for kw in kws if kw in low)
+        if hits > 0:
+            scored.append((hits, pno + 1, txt.strip()))
+    scored.sort(reverse=True)
+    doc.close()
+
+    if not scored:
+        # Fallback: first 6 pages
+        doc2   = fitz.open(proposal_path)
+        parts  = [f"[Page {i+1}]\n{doc2[i].get_text().strip()[:500]}"
+                  for i in range(min(6, len(doc2)))]
+        doc2.close()
+        return "\n\n".join(parts)[:max_chars]
+
     parts, total = [], 0
-    for c in chunks[:max_chunks]:
-        block = f"[Page {c.get('page_no', 0)}]\n{c.get('text', '')}"
-        if total + len(block) > max_chars: break
+    for _, pno, txt in scored[:3]:
+        block = f"[Page {pno}]\n{txt}"
+        if total + len(block) > max_chars:
+            block = block[:max_chars - total]
         parts.append(block); total += len(block)
+        if total >= max_chars: break
+
     return "\n\n---\n\n".join(parts)
 
 
-def score_criterion(criterion: dict, proposal_doc_name: str) -> dict:
-    max_marks = int(criterion.get("max_marks") or 0)
-    if max_marks == 0:
-        return {"score": 0, "extracted_value": None, "source_page": None,
-                "scoring_steps": "Zero-mark criterion.",
-                "justification": "Skipped -- zero marks.",
-                "strengths": [], "gaps": [], "evidence_found": False}
+# -- Fact extraction ----------------------------------------------------------
 
-    context = _get_proposal_context(criterion, proposal_doc_name)
-    if not context:
-        return {"score": 0, "extracted_value": None, "source_page": None,
-                "scoring_steps": "No proposal content found.",
-                "justification": f"No evidence for '{criterion['parameter']}'.",
-                "strengths": [],
-                "gaps": [f"'{criterion['parameter']}' not found."],
-                "evidence_found": False}
+_EXTRACT_PROMPT = """\
+Read the proposal pages and find ONE specific piece of information.
 
-    raw = _call_ollama(
-        _SCORE_PROMPT.format(
-            parameter        = _esc(criterion["parameter"]),
-            max_marks        = max_marks,
-            criteria_text    = _esc(criterion.get("criteria_text",
-                                                  "Award marks based on quality.")),
-            proposal_context = _esc(context),
-        ),
-        ctx=8192,
+FIND: {what}
+
+PROPOSAL PAGES:
+{pages}
+
+Return ONLY valid JSON:
+{{"found": true or false, "value": "<exact value e.g. 180 Cr or 8 professionals or 3 projects>", "page": <integer or null>}}
+
+If not found: {{"found": false, "value": null, "page": null}}"""
+
+
+def _what_to_find(parameter: str, criteria_text: str) -> str:
+    combined = (parameter + " " + criteria_text).lower()
+    if "turnover" in combined:
+        return ("the bidder's average annual turnover in Indian Rupees Crore (INR Cr) "
+                "over the last 3 financial years -- single number in Crore")
+    if any(w in combined for w in ["professional", "manpower", "employees in supply"]):
+        return ("the maximum number of professionals / employees supplied in a SINGLE "
+                "work order for advisory or consulting services -- single integer count")
+    if any(w in combined for w in ["pmc", "pmu", "urban", "amrut", "billing", "consulting",
+                                    "assignment", "project"]):
+        return ("the number of eligible consulting / PMC / PMU assignments "
+                "with client billing of at least Rs 0.4 Cr per assignment -- single integer count")
+    if any(w in combined for w in ["qualification", "competence", "cv", "staff"]):
+        return ("for each proposed team member: name, role, highest educational qualification, "
+                "years of relevant experience -- list all")
+    if any(w in combined for w in ["methodology", "approach", "work plan"]):
+        return ("whether the proposal contains a technical methodology or work plan -- "
+                "YES with page reference, or NO")
+    return f"the specific information required by the criterion: {parameter}"
+
+
+def _extract_fact(proposal_path: str, parameter: str, criteria_text: str) -> dict:
+    """Returns {found, value, page}."""
+    pages  = _get_proposal_pages(proposal_path, parameter, criteria_text)
+    if not pages:
+        return {"found": False, "value": None, "page": None}
+
+    what   = _what_to_find(parameter, criteria_text)
+    prompt = _EXTRACT_PROMPT.format(what=what, pages=pages)
+    print(f"    [fact] prompt={len(prompt)} chars")
+
+    raw    = _call_ollama(prompt, ctx=4096, timeout=OLLAMA_TIMEOUT_S)
+    result = _parse_json(raw) if raw else None
+    if result:
+        return {
+            "found": bool(result.get("found")),
+            "value": str(result["value"]) if result.get("value") else None,
+            "page":  result.get("page"),
+        }
+    return {"found": False, "value": None, "page": None}
+
+
+# -- Python formula implementations ------------------------------------------
+
+def _step_formula(criteria_text: str, max_marks: int, value_str: str) -> Optional[float]:
+    """Turnover step scoring: base + increments per extra N Cr."""
+    base_m = re.search(
+        r"(\d+(?:\.\d+)?)\s*cr[ores]*\s*[.=:\-\s]+\s*(\d+(?:\.\d+)?)\s*marks?",
+        criteria_text, re.IGNORECASE,
     )
-
-    if not raw.strip():
-        return {"score": 0, "extracted_value": None, "source_page": None,
-                "scoring_steps": "LLM returned empty.",
-                "justification": "Manual review required.",
-                "strengths": [], "gaps": ["LLM call failed."], "evidence_found": False}
-
+    step_m = re.search(
+        r"(?:every|each|per)\s+additional\s+(\d+(?:\.\d+)?)\s*cr[ores]*"
+        r"[\s\W]*(\d+(?:\.\d+)?)\s*marks?",
+        criteria_text, re.IGNORECASE,
+    )
+    if not (base_m and step_m):
+        return None
     try:
-        result = json.loads(_clean_json(raw))
-        score  = round(max(0.0, min(float(result.get("score") or 0),
-                                     float(max_marks))), 1)
-        result["score"] = score
-        result.setdefault("source_page",     None)
-        result.setdefault("extracted_value", None)
-        result.setdefault("scoring_steps",   "")
-        result.setdefault("strengths",       [])
-        result.setdefault("gaps",            [])
-        result.setdefault("evidence_found",  False)
-        return result
-    except (json.JSONDecodeError, ValueError, TypeError) as e:
-        print(f"[TQ] Score parse failed for '{criterion['parameter']}'\n"
-              f"  raw: {raw[:200]}")
+        base_threshold = float(base_m.group(1))
+        base_score     = float(base_m.group(2))
+        step_size      = float(step_m.group(1))
+        step_score     = float(step_m.group(2))
+        nums = re.findall(r"[\d,]+(?:\.\d+)?", value_str.replace(",", ""))
+        if not nums: return None
+        turnover = float(nums[0])
+        if turnover < base_threshold: return 0.0
+        extra_steps = int((turnover - base_threshold) / step_size)
+        return round(min(base_score + extra_steps * step_score, max_marks), 1)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def _band_formula(criteria_text: str, max_marks: int, value_str: str) -> Optional[float]:
+    """Professionals band scoring: ordered thresholds."""
+    ct = criteria_text.lower()
+    # Build bands from "N professionals : M marks" and "more than N professionals : M marks"
+    simple_bands = re.findall(
+        r"(?:of\s+)?(\d+)\s+professionals?\s*[:\-]\s*(\d+)\s*marks?", ct, re.IGNORECASE
+    )
+    range_bands = re.findall(
+        r"more\s+than\s+(\d+)(?:[\s\-]*and[\s\-]*up[\s\-]*to\s+(\d+))?\s+"
+        r"professionals?\s*[:\-]\s*(\d+)\s*marks?", ct, re.IGNORECASE
+    )
+    bands = []
+    for cnt, mk in simple_bands:
+        bands.append((int(cnt), int(mk)))
+    for lo, hi, mk in range_bands:
+        upper = int(hi) if hi else 9999
+        bands.append((upper, int(mk)))
+    if not bands: return None
+    bands.sort(key=lambda b: b[0])
+    try:
+        nums = re.findall(r"\d+", value_str)
+        if not nums: return None
+        count = int(nums[0])
+        score = float(bands[-1][1])
+        for upper, mk in bands:
+            if count <= upper:
+                score = float(mk); break
+        return round(min(score, max_marks), 1)
+    except (ValueError, IndexError):
+        return None
+
+
+def _per_unit_formula(criteria_text: str, max_marks: int, value_str: str) -> Optional[float]:
+    """Per-project scoring: N marks per project, capped."""
+    rate_m = re.search(
+        r"(\d+(?:\.\d+)?)\s*marks?\s+for\s+(?:\d+|each|01|per)\s+(?:project|assignment)",
+        criteria_text, re.IGNORECASE,
+    )
+    if not rate_m: return None
+    try:
+        rate = float(rate_m.group(1))
+        nums = re.findall(r"\d+", value_str)
+        if not nums: return None
+        count = int(nums[0])
+        return round(min(count * rate, max_marks), 1)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def _qual_formula(proposal_path: str, parameter: str,
+                  criteria_text: str, max_marks: int) -> tuple[float, str]:
+    """Qualifications: structured evidence check with a small LLM call."""
+    pages  = _get_proposal_pages(proposal_path, parameter, criteria_text, max_chars=1_500)
+    prompt = f"""Check if the proposal includes the following. Answer YES or NO for each.
+
+1. Named team members or proposed experts?
+2. Educational qualifications stated (degree, diploma, certification)?
+3. Years of relevant experience stated for each expert?
+4. Relevant projects listed for the proposed team?
+5. CVs or detailed profiles attached?
+
+PROPOSAL:
+{pages}
+
+Return ONLY valid JSON:
+{{"q1": true/false, "q2": true/false, "q3": true/false, "q4": true/false, "q5": true/false, "note": "one sentence"}}"""
+
+    raw    = _call_ollama(prompt, ctx=4096, timeout=OLLAMA_TIMEOUT_S)
+    result = _parse_json(raw) if raw else {}
+    if not result:
+        return 0.0, "Qualification evidence check failed"
+
+    weights = {"q1": 0.10, "q2": 0.20, "q3": 0.20, "q4": 0.30, "q5": 0.20}
+    total_w = sum(w for k, w in weights.items() if result.get(k, False))
+    score   = round(total_w * max_marks, 1)
+    return score, result.get("note", "")
+
+
+def _llm_score_formula(proposal_path: str, parameter: str, criteria_text: str,
+                        max_marks: int, extracted: dict) -> tuple[float, str]:
+    """LLM scoring for methodology / open-ended criteria."""
+    pages = _get_proposal_pages(proposal_path, parameter, criteria_text, max_chars=1_200)
+    ev    = extracted.get("value") or "Not explicitly found"
+    pg    = extracted.get("page") or "unknown"
+    rule  = criteria_text[:300]
+
+    prompt = f"""Score a vendor proposal against one RFP criterion.
+
+CRITERION: {parameter}
+MAX MARKS: {max_marks}
+SCORING RULE: {rule}
+
+WHAT WAS FOUND: {ev} (page {pg})
+
+PROPOSAL EXCERPT:
+{pages[:800]}
+
+Score 0 to {max_marks}. Base on quality and relevance of evidence found.
+
+Return ONLY valid JSON:
+{{"score": <0 to {max_marks}>, "justification": "one sentence"}}"""
+
+    raw    = _call_ollama(prompt, ctx=4096, timeout=OLLAMA_TIMEOUT_S)
+    result = _parse_json(raw) if raw else {}
+    if not result:
+        return 0.0, "LLM scoring failed"
+    try:
+        score = round(max(0.0, min(float(result.get("score") or 0), float(max_marks))), 1)
+        return score, result.get("justification", "")
+    except (TypeError, ValueError):
+        return 0.0, "Score conversion error"
+
+
+# -- Main criterion scorer ----------------------------------------------------
+
+def score_criterion(criterion: dict, proposal_path: str) -> dict:
+    """
+    Score one criterion against the proposal.
+    Returns the standard result dict.
+    """
+    max_marks     = int(criterion.get("max_marks") or 0)
+    parameter     = criterion.get("parameter", "")
+    criteria_text = criterion.get("criteria_text", "")
+
+    def _zero(reason: str) -> dict:
         return {"score": 0, "extracted_value": None, "source_page": None,
-                "scoring_steps": f"Parse error: {e}",
-                "justification": "Parse error -- manual review.",
-                "strengths": [], "gaps": [str(e)], "evidence_found": False}
+                "scoring_steps": reason, "justification": reason,
+                "strengths": [], "gaps": [reason], "evidence_found": False}
+
+    if max_marks == 0:
+        return _zero("Zero-mark criterion")
+
+    if not Path(proposal_path).exists():
+        return _zero(f"Proposal file not found: {proposal_path}")
+
+    formula = _detect_formula(parameter, criteria_text)
+    print(f"    [formula] {formula}")
+
+    # Qualifications: structured check, no single-fact extraction needed
+    if formula == "QUAL":
+        score, note = _qual_formula(proposal_path, parameter, criteria_text, max_marks)
+        return {
+            "score":           score,
+            "extracted_value": note or "Qualifications evidence check",
+            "source_page":     None,
+            "scoring_steps":   f"Structured evidence check -> {score}/{max_marks}",
+            "justification":   note or f"Score {score}/{max_marks} based on CV/qualifications evidence",
+            "strengths":       [note] if note and score > 0 else [],
+            "gaps":            [] if score >= max_marks * 0.8 else ["Full marks require detailed CVs for all roles"],
+            "evidence_found":  score > 0,
+        }
+
+    # Stage A: extract the specific fact
+    extracted = _extract_fact(proposal_path, parameter, criteria_text)
+    ev        = extracted.get("value") or "Not found"
+    pg        = extracted.get("page")
+    found     = extracted.get("found", False)
+    print(f"    [fact] found={found}  value={ev!r}  page={pg}")
+
+    if not found:
+        if formula == "LLM":
+            score, just = _llm_score_formula(
+                proposal_path, parameter, criteria_text, max_marks, extracted)
+            return _make_result(score, ev, pg, f"LLM: {just}", max_marks)
+        return _zero(f"Key fact not found: {_what_to_find(parameter, criteria_text)[:80]}")
+
+    # Stage B: apply Python formula
+    python_score: Optional[float] = None
+    steps = ""
+
+    if formula == "STEP":
+        python_score = _step_formula(criteria_text, max_marks, ev)
+        steps = f"STEP formula: value={ev} -> {python_score}/{max_marks}"
+    elif formula == "BAND":
+        python_score = _band_formula(criteria_text, max_marks, ev)
+        steps = f"BAND formula: value={ev} -> {python_score}/{max_marks}"
+    elif formula == "PER_UNIT":
+        python_score = _per_unit_formula(criteria_text, max_marks, ev)
+        steps = f"PER_UNIT formula: value={ev} -> {python_score}/{max_marks}"
+    else:
+        score, just = _llm_score_formula(
+            proposal_path, parameter, criteria_text, max_marks, extracted)
+        return _make_result(score, ev, pg, f"LLM: {just}", max_marks)
+
+    if python_score is not None:
+        print(f"    [Python] {steps}")
+        return _make_result(python_score, ev, pg, steps, max_marks)
+
+    # Python formula parse failed -- LLM fallback
+    print(f"    [LLM fallback] formula parse failed for {formula}")
+    score, just = _llm_score_formula(
+        proposal_path, parameter, criteria_text, max_marks, extracted)
+    return _make_result(score, ev, pg, f"LLM fallback: {just}", max_marks)
+
+
+def _make_result(score: float, ev: str, pg: Optional[int],
+                 steps: str, max_marks: int) -> dict:
+    score = round(max(0.0, min(score, float(max_marks))), 1)
+    return {
+        "score":           score,
+        "extracted_value": ev,
+        "source_page":     pg,
+        "scoring_steps":   steps,
+        "justification":   f"Score {score}/{max_marks}. Found: {ev}" + (f" (p.{pg})" if pg else ""),
+        "strengths":       [f"Found: {ev}" + (f" (p.{pg})" if pg else "")] if score > 0 else [],
+        "gaps":            [] if score >= max_marks else ["Additional evidence needed for full marks"],
+        "evidence_found":  score > 0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -943,9 +1338,8 @@ def run_tq_evaluation(
             "error": table.get("error", "No criteria extracted."),
         }
 
-    doc_max     = table.get("doc_max", sum(int(c.get("max_marks") or 0) for c in criteria))
-    grand_total = table.get("grand_total_marks", doc_max)
-    threshold   = table.get("qualification_threshold_pct")
+    doc_max   = table.get("doc_max", sum(c["max_marks"] for c in criteria))
+    threshold = table.get("qualification_threshold_pct", 70.0)
 
     _prog(f"Found {len(criteria)} criteria ({doc_max} marks)", 15)
     _prog("Ingesting proposal", 20)
@@ -958,8 +1352,9 @@ def run_tq_evaluation(
     for i, criterion in enumerate(criteria):
         pct = 28 + int((i / max(n, 1)) * 65)
         _prog(f"Scoring: {criterion['parameter'][:55]}", pct)
+
         try:
-            result = score_criterion(criterion, proposal_doc_name)
+            result = score_criterion(criterion, proposal_path)
         except Exception as e:
             print(f"[TQ] Error scoring '{criterion['parameter']}': {e}")
             result = {"score": 0, "extracted_value": None, "source_page": None,
@@ -1005,13 +1400,12 @@ def run_tq_evaluation(
     schema_warning = table.get("schema_warning")
     print(f"[TQ] -- Result --------------------------------------------------")
     print(f"[TQ] Scored: {total_scored} / {doc_max}  ({total_pct}%)")
-    print(f"[TQ] Grand total (RFP declares): {grand_total}")
     if schema_warning:
         print(f"[TQ] WARNING: {schema_warning}")
 
     return {
         "evaluation_title":        table.get("evaluation_title", "Technical Evaluation"),
-        "grand_total_marks":       grand_total,
+        "grand_total_marks":       table.get("grand_total_marks", doc_max),
         "technical_document_max":  doc_max,
         "scoreable_total":         doc_max,
         "live_assessment_marks":   0,
