@@ -14,13 +14,22 @@ Tables:
   learned_rules     — LLM-synthesised evaluation rules per offering/solution/clause
   tq_evaluations    — SSC2: one TQ evaluation per RFP + proposal upload
   tq_score_items    — SSC2: one scored criterion per evaluation
+
+FIX NOTES (v3)
+--------------
+- pool_pre_ping=True  : tests every connection before handing it out.
+- pool_recycle=1800   : force-retires connections after 30 min.
+- TQEvaluation now includes scoreable_total, live_assessment_marks,
+  financial_methodology_json, schema_valid, schema_warning columns.
+- TQScoreItem now includes requires_live_assessment column.
+- _safe_alter_columns() adds all of the above if they don't exist.
 """
 
 import os
 from datetime import datetime
 from sqlalchemy import (
     create_engine, Column, Integer, String, Text,
-    Boolean, DateTime, ForeignKey, Enum
+    Boolean, DateTime, ForeignKey,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from dotenv import load_dotenv
@@ -31,7 +40,11 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set in .env file")
 
-engine = create_engine(DATABASE_URL)
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
@@ -40,13 +53,27 @@ def get_db():
     db = SessionLocal()
     try:
         yield db
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise
     finally:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+def get_fresh_db():
+    """Non-generator session for background tasks — caller must close()."""
+    return SessionLocal()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Tables
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 
 class User(Base):
     __tablename__ = "users"
@@ -55,8 +82,6 @@ class User(Base):
     name          = Column(String(100), nullable=False)
     email         = Column(String(150), unique=True, index=True, nullable=False)
     password_hash = Column(String(200), nullable=False)
-    # Roles: admin | reviewer | tq_reviewer
-    # Using String instead of Enum to avoid painful Postgres enum alteration
     role          = Column(String(20), default="reviewer")
     created_at    = Column(DateTime, default=datetime.utcnow)
 
@@ -86,11 +111,11 @@ class RFP(Base):
     uploaded_by      = Column(Integer, ForeignKey("users.id"))
     created_at       = Column(DateTime, default=datetime.utcnow)
 
-    uploaded_by_user  = relationship("User", back_populates="rfps")
-    clause_results    = relationship("ClauseResult", back_populates="rfp", cascade="all, delete")
-    comments          = relationship("Comment", back_populates="rfp", cascade="all, delete")
-    feedbacks         = relationship("ClauseFeedback", back_populates="rfp", cascade="all, delete")
-    tq_evaluations    = relationship("TQEvaluation", back_populates="rfp", cascade="all, delete")
+    uploaded_by_user = relationship("User", back_populates="rfps")
+    clause_results   = relationship("ClauseResult", back_populates="rfp", cascade="all, delete")
+    comments         = relationship("Comment", back_populates="rfp", cascade="all, delete")
+    feedbacks        = relationship("ClauseFeedback", back_populates="rfp", cascade="all, delete")
+    tq_evaluations   = relationship("TQEvaluation", back_populates="rfp", cascade="all, delete")
 
 
 class ClauseResult(Base):
@@ -150,7 +175,7 @@ class ClauseFeedback(Base):
     solution             = Column(String(500))
     bu                   = Column(String(150))
 
-    agreement            = Column(String(20), nullable=False)  # agree|too_high|too_low|incorrect
+    agreement            = Column(String(20), nullable=False)
     suggested_risk_level = Column(String(30), nullable=True)
     feedback_comment     = Column(Text, nullable=True)
     system_risk_level    = Column(String(30), nullable=False)
@@ -205,27 +230,35 @@ class LearnedRule(Base):
     generated_at          = Column(DateTime, default=datetime.utcnow)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 # SSC2 / TQ Tables
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 
 class TQEvaluation(Base):
-    """
-    One TQ (Technical Qualification) evaluation per RFP + proposal upload.
-    Multiple evaluations per RFP are allowed (different proposals or re-runs).
-    The latest evaluation for an RFP is used in the review page.
-    """
+    """One TQ evaluation per RFP + proposal upload."""
     __tablename__ = "tq_evaluations"
 
     id                 = Column(Integer, primary_key=True, index=True)
     rfp_id             = Column(Integer, ForeignKey("rfps.id"), nullable=False)
-    proposal_file_name = Column(String(300))        # original uploaded filename
-    proposal_doc_name  = Column(String(300))        # ChromaDB namespace key
+    proposal_file_name = Column(String(300))
+    proposal_doc_name  = Column(String(300))
     evaluation_title   = Column(String(300), default="Technical Evaluation")
     grand_total_marks  = Column(Integer, default=100)
-    total_scored       = Column(String(20), default="0")     # decimal stored as string
+    total_scored       = Column(String(20), default="0")
     total_percentage   = Column(String(20), default="0")
-    status             = Column(String(30), default="queued")  # queued|processing|completed|failed
+
+    # Denominator breakdown (added v3)
+    scoreable_total          = Column(Integer, default=0)   # marks that can be scored from document
+    live_assessment_marks    = Column(Integer, default=0)   # marks requiring live presentation/interview
+
+    # Schema quality signal (added v3)
+    schema_valid             = Column(Boolean, default=False)
+    schema_warning           = Column(Text, nullable=True)
+
+    # Financial methodology extracted from RFP (added v3)
+    financial_methodology_json = Column(Text, nullable=True)
+
+    status             = Column(String(30), default="queued")
     progress           = Column(Integer, default=0)
     current_step       = Column(String(200), default="")
     error_message      = Column(Text, nullable=True)
@@ -243,35 +276,32 @@ class TQEvaluation(Base):
 
 
 class TQScoreItem(Base):
-    """
-    One scored criterion per TQEvaluation.
-    Sub-items are stored with is_sub_item=True and parent_parameter set.
-    This flat storage makes aggregation simple while the UI reconstructs hierarchy.
-    """
+    """One scored criterion per TQEvaluation."""
     __tablename__ = "tq_score_items"
 
-    id                 = Column(Integer, primary_key=True, index=True)
-    evaluation_id      = Column(Integer, ForeignKey("tq_evaluations.id"), nullable=False)
-    item_code          = Column(String(20))
-    parameter          = Column(String(300))
-    max_marks          = Column(Integer, default=0)
-    score              = Column(String(20), default="0")         # decimal as string
-    score_percentage   = Column(String(20), default="0")
-    justification      = Column(Text)
-    strengths_json     = Column(Text, default="[]")              # JSON array
-    gaps_json          = Column(Text, default="[]")              # JSON array
-    evidence_found     = Column(Boolean, default=False)
-    is_sub_item        = Column(Boolean, default=False)
-    parent_parameter   = Column(String(300), default="")
-    criteria_text      = Column(Text)
-    sort_order         = Column(Integer, default=0)
+    id                       = Column(Integer, primary_key=True, index=True)
+    evaluation_id            = Column(Integer, ForeignKey("tq_evaluations.id"), nullable=False)
+    item_code                = Column(String(20))
+    parameter                = Column(String(300))
+    max_marks                = Column(Integer, default=0)
+    score                    = Column(String(20), default="0")     # "-1" means pending
+    score_percentage         = Column(String(20), default="0")     # "-1" means pending
+    justification            = Column(Text)
+    strengths_json           = Column(Text, default="[]")
+    gaps_json                = Column(Text, default="[]")
+    evidence_found           = Column(Boolean, default=False)
+    is_sub_item              = Column(Boolean, default=False)
+    parent_parameter         = Column(String(300), default="")
+    criteria_text            = Column(Text)
+    sort_order               = Column(Integer, default=0)
+    requires_live_assessment = Column(Boolean, default=False)      # added v3
 
     evaluation = relationship("TQEvaluation", back_populates="scores")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 # Init
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 
 def init_db():
     Base.metadata.create_all(bind=engine)
@@ -298,9 +328,10 @@ def init_db():
 
 
 def _safe_alter_columns():
+    """Idempotent schema migrations — safe to run on every startup."""
     from sqlalchemy import text
     alterations = [
-        # SSC1 / PQ additions (existing)
+        # SSC1 / PQ
         "ALTER TABLE rfps ADD COLUMN IF NOT EXISTS country VARCHAR(100)",
         "ALTER TABLE clause_results ADD COLUMN IF NOT EXISTS adjusted_risk_level VARCHAR(30)",
         "ALTER TABLE clause_results ADD COLUMN IF NOT EXISTS adjustment_reason TEXT",
@@ -308,24 +339,32 @@ def _safe_alter_columns():
         "ALTER TABLE clause_results ADD COLUMN IF NOT EXISTS feedback_count INTEGER DEFAULT 0",
         "ALTER TABLE clause_results ADD COLUMN IF NOT EXISTS learned_rule_applied BOOLEAN DEFAULT FALSE",
         "ALTER TABLE clause_results ADD COLUMN IF NOT EXISTS learned_rule_id INTEGER",
-
-        # SSC2 / TQ: migrate role column from Enum to VARCHAR if needed
-        # (safe to run multiple times — IF NOT EXISTS guards handle it)
         "ALTER TABLE users ALTER COLUMN role TYPE VARCHAR(20)",
 
-        # SSC2 / TQ: ensure new columns exist if tables were created before this migration
+        # SSC2 / TQ evaluations — v1 columns
         "ALTER TABLE tq_evaluations ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP",
+
+        # SSC2 / TQ evaluations — v3 columns (denominator + schema quality)
+        "ALTER TABLE tq_evaluations ADD COLUMN IF NOT EXISTS scoreable_total INTEGER DEFAULT 0",
+        "ALTER TABLE tq_evaluations ADD COLUMN IF NOT EXISTS live_assessment_marks INTEGER DEFAULT 0",
+        "ALTER TABLE tq_evaluations ADD COLUMN IF NOT EXISTS schema_valid BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE tq_evaluations ADD COLUMN IF NOT EXISTS schema_warning TEXT",
+        "ALTER TABLE tq_evaluations ADD COLUMN IF NOT EXISTS financial_methodology_json TEXT",
+
+        # SSC2 / TQ score items — v1 columns
         "ALTER TABLE tq_score_items ADD COLUMN IF NOT EXISTS criteria_text TEXT",
         "ALTER TABLE tq_score_items ADD COLUMN IF NOT EXISTS parent_parameter VARCHAR(300) DEFAULT ''",
+
+        # SSC2 / TQ score items — v3 columns
+        "ALTER TABLE tq_score_items ADD COLUMN IF NOT EXISTS requires_live_assessment BOOLEAN DEFAULT FALSE",
     ]
     try:
         with engine.connect() as conn:
             for stmt in alterations:
                 try:
                     conn.execute(text(stmt))
-                except Exception as e:
-                    # Silently skip — column may already exist or type already correct
-                    pass
+                except Exception:
+                    pass    # column may already exist — that's fine
             conn.commit()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[DB] _safe_alter_columns warning: {e}")

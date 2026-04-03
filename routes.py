@@ -118,6 +118,14 @@ class ExampleUpdateRequest(BaseModel):
 # ══════════════════════════════════════════════════════════════════════════════
 # Serialisers
 # ══════════════════════════════════════════════════════════════════════════════
+def _parse_fin_methodology(ev) -> dict | None:
+        try:
+            raw = ev.financial_methodology_json
+            if raw:
+                return json.loads(raw)
+        except Exception:
+            pass
+        return None
 
 def user_to_dict(u: User) -> dict:
     return {
@@ -234,63 +242,109 @@ def rfp_to_dict(rfp: RFP, include_clauses=False, viewer_role="reviewer") -> dict
 # Background pipeline task — learning-aware
 # ══════════════════════════════════════════════════════════════════════════════
 
+"""
+run_pipeline_task — replacement for the function in routes.py
+-------------------------------------------------------------
+Paste this function over the existing run_pipeline_task definition in routes.py.
+Everything else in routes.py stays the same.
+
+KEY CHANGES vs the original
+----------------------------
+1.  extract_all_clauses no longer receives `db`.
+    The extractor now opens its own fresh session per clause (see core/extractor.py).
+    Passing `db` was the root cause of the SSL-drop cascade.
+
+2.  get_learned_rule and get_adjustment each use a fresh short-lived session
+    opened and closed inside a try/finally. If any one query fails, only that
+    query's session is affected; the main session is untouched.
+
+3.  The main session (`db`) is ONLY used for:
+      - reading the RFP row
+      - updating rfp.status / rfp.progress
+      - writing ClauseResult rows
+      - committing at the very end
+    It is NEVER held open during any Ollama call.
+
+4.  Every db.commit() that writes RFP state is wrapped in its own try/except
+    so a transient DB blip cannot prevent clause results from being saved.
+
+5.  The final failure handler re-opens a fresh session if the main one is dead,
+    so the "failed" status is always written even after a catastrophic error.
+"""
+
+from pathlib import Path
+
+
 def run_pipeline_task(rfp_id: int, file_path: str, job_id: str):
-    """
-    Full analysis pipeline — integrates the learning loop:
+    from database import SessionLocal, RFP, ClauseResult, LearnedRule
 
-    1. parse → ingest (unchanged)
-    2. extract_all_clauses() receives db + offering/solution →
-       few-shot examples are injected into each LLM prompt automatically
-    3. get_learned_rule() checks for a synthesised rule per clause →
-       flagged on ClauseResult if active
-    4. evaluate_clause() applies static risk rules (or learned rule overrides)
-    5. get_adjustment() applies feedback-engine numeric adjustments on top
-    6. All saved to DB with full learning metadata
-    """
-    from database import SessionLocal
+    # ── helpers ────────────────────────────────────────────────────────────────
 
-    db = SessionLocal()
+    def _fresh_db():
+        """Return a brand-new session.  Caller must close() in a finally block."""
+        return SessionLocal()
+
+    def _safe_commit(db, label=""):
+        try:
+            db.commit()
+        except Exception as e:
+            print(f"[Pipeline] commit failed ({label}): {e}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+    # ── open main session ──────────────────────────────────────────────────────
+    db = _fresh_db()
+
     try:
         rfp = db.query(RFP).filter(RFP.id == rfp_id).first()
+        if not rfp:
+            print(f"[Pipeline] RFP {rfp_id} not found — aborting.")
+            return
 
+        # ── status helper (uses main session) ─────────────────────────────────
         def update(status, progress, step):
-            rfp.status = status
-            rfp.progress = progress
-            rfp.current_step = step
-            db.commit()
+            try:
+                rfp.status       = status
+                rfp.progress     = progress
+                rfp.current_step = step
+                db.commit()
+            except Exception as e:
+                print(f"[Pipeline] status update failed: {e}")
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
 
         update("processing", 10, "Parsing document")
 
+        from routes import _parse_offering_solutions   # local import — avoids circular
         offerings, solutions = _parse_offering_solutions(rfp.offering or "", rfp.solutions or "")
         primary_offering = offerings[0] if offerings else ""
         primary_solution = solutions[0] if solutions else ""
 
-        from core.parser import parse_document
+        from core.parser       import parse_document
         from core.vector_store import ingest_chunks
-        from core.extractor import extract_all_clauses
+        from core.extractor    import extract_all_clauses
         from rules.risk_engine import evaluate_clause, RiskResult
 
         doc_name = Path(file_path).name
-        chunks = parse_document(file_path)
+        chunks   = parse_document(file_path)
         print(f"[Pipeline] {len(chunks)} chunks extracted")
 
         update("processing", 35, "Ingesting into vector store")
         ingest_chunks(chunks, doc_id=doc_name)
-        # ── Metadata extraction ───────────────────────────────────────────────
-        # Runs immediately after ingestion. Always overwrites blank/placeholder
-        # values so the LLM result is always used.
+
+        # ── Metadata extraction ────────────────────────────────────────────────
+        # Uses its own requests call (no DB held open).
         update("processing", 45, "Extracting document metadata")
         try:
             from core.metadata_extractor import extract_metadata
-            meta = extract_metadata(doc_name)
+            meta     = extract_metadata(doc_name)
             opp_name = meta.get("opportunity_name")
             cli_name = meta.get("client_name")
-            meta_err_msg = meta.get("error")
 
-            if meta_err_msg:
-                print(f"[Pipeline] Metadata extractor warning: {meta_err_msg}")
-
-            # Always overwrite if LLM returned something meaningful
             if opp_name and len(opp_name.strip()) > 5:
                 rfp.opportunity_name = opp_name.strip()
                 print(f"[Pipeline] opportunity_name set: {rfp.opportunity_name!r}")
@@ -303,26 +357,35 @@ def run_pipeline_task(rfp_id: int, file_path: str, job_id: str):
             else:
                 print(f"[Pipeline] client_name not extracted (got: {cli_name!r})")
 
-            db.commit()
+            _safe_commit(db, "metadata")
         except Exception as meta_exc:
-            print(f"[Pipeline] Metadata extraction FAILED: {meta_exc}")
-        # ── End metadata extraction ───────────────────────────────────────────
+            print(f"[Pipeline] Metadata extraction skipped: {meta_exc}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
 
-
-        # Metadata extraction — runs immediately after ingestion so it always
-        # completes even if the clause extraction fails for any reason.
+        # ── Clause extraction ──────────────────────────────────────────────────
+        # IMPORTANT: do NOT pass `db` here.
+        # extract_all_clauses v2 opens its own fresh session per clause lookup,
+        # so no DB connection is ever held open during an Ollama call.
         update("processing", 50, "Extracting clauses (with learning context)")
 
-        # KEY INTEGRATION POINT:
-        # db + offering/solution passed so extractor can inject few-shot examples
-        extraction_results = extract_all_clauses(
-            doc_name=doc_name,
-            model="llama3.2",
-            offering=primary_offering,
-            solution=primary_solution,
-            db=db,
-        )
+        extraction_results = {}
+        try:
+            extraction_results = extract_all_clauses(
+                doc_name=doc_name,
+                model="llama3.2",
+                offering=primary_offering,
+                solution=primary_solution,
+                # db intentionally omitted — extractor manages its own sessions
+            )
+        except Exception as ext_exc:
+            print(f"[Pipeline] Clause extraction error: {ext_exc}")
+            # Continue — we'll save whatever partial results we have
 
+        # ── Learned-rule lookup ────────────────────────────────────────────────
+        # Fresh session per clause type — closed immediately after the query.
         update("processing", 70, "Evaluating risk + checking learned rules")
 
         CLAUSE_ORDER = [
@@ -330,49 +393,67 @@ def run_pipeline_task(rfp_id: int, file_path: str, job_id: str):
             "personnel", "ld", "penalties", "termination", "eligibility",
         ]
 
-        # Check which clauses have an active learned rule for this offering/solution
         from rules.learning_store import get_learned_rule
         learned_rule_ids: dict = {}
         for ct in CLAUSE_ORDER:
-            rule_text = get_learned_rule(ct, primary_offering, primary_solution, db)
-            if rule_text:
-                rule_row = db.query(LearnedRule).filter(
-                    LearnedRule.clause_type == ct,
-                    LearnedRule.is_active == True,
-                ).first()
-                if rule_row:
-                    learned_rule_ids[ct] = rule_row.id
-                    print(f"[Pipeline] Learned rule active: {ct} / {primary_offering}")
+            _db2 = _fresh_db()
+            try:
+                rule_text = get_learned_rule(ct, primary_offering, primary_solution, _db2)
+                if rule_text:
+                    rule_row = _db2.query(LearnedRule).filter(
+                        LearnedRule.clause_type == ct,
+                        LearnedRule.is_active   == True,
+                    ).first()
+                    if rule_row:
+                        learned_rule_ids[ct] = rule_row.id
+                        print(f"[Pipeline] Learned rule active: {ct} / {primary_offering}")
+            except Exception as lr_err:
+                print(f"[Pipeline] Learned rule lookup failed ({ct}): {lr_err}")
+            finally:
+                try:
+                    _db2.close()
+                except Exception:
+                    pass
 
+        # ── Risk evaluation + feedback adjustment ──────────────────────────────
         update("processing", 82, "Saving results")
 
         for ct in CLAUSE_ORDER:
             ext  = extraction_results.get(ct, {})
             exd  = ext.get("extracted", {})
-            l_app = ext.get("learning_applied", False)
 
             try:
                 risk = evaluate_clause(ct, exd)
-            except Exception as e:
+            except Exception as re_err:
                 risk = RiskResult(
-                    clause_name=ct, risk_level="NEEDS_REVIEW",
-                    risk_description=f"Evaluation failed: {e}", auto_remark="",
+                    clause_name=ct,
+                    risk_level="NEEDS_REVIEW",
+                    risk_description=f"Evaluation failed: {re_err}",
+                    auto_remark="",
                 )
 
-            # Feedback-engine numeric adjustment
+            # Feedback adjustment — fresh session, closed immediately
+            adj_level = adj_reason = adj_conf = None
+            adj_count = 0
+            _db3 = _fresh_db()
             try:
                 from rules.feedback_engine import get_adjustment
-                adj = get_adjustment(ct, primary_offering, primary_solution, risk.risk_level, db)
+                adj = get_adjustment(ct, primary_offering, primary_solution, risk.risk_level, _db3)
                 adj_level  = adj["adjusted_risk_level"] if adj["applied"] else None
-                adj_reason = adj["reason"] if adj["applied"] else None
-                adj_conf   = str(adj["confidence"]) if adj["applied"] else None
+                adj_reason = adj["reason"]              if adj["applied"] else None
+                adj_conf   = str(adj["confidence"])     if adj["applied"] else None
                 adj_count  = adj["feedback_count"]
-            except Exception:
-                adj_level = adj_reason = adj_conf = None
-                adj_count = 0
+            except Exception as adj_err:
+                print(f"[Pipeline] Adjustment lookup failed ({ct}): {adj_err}")
+            finally:
+                try:
+                    _db3.close()
+                except Exception:
+                    pass
 
             cr = ClauseResult(
-                rfp_id=rfp_id, clause_type=ct,
+                rfp_id=rfp_id,
+                clause_type=ct,
                 clause_text=exd.get("clause_text") or exd.get("summary", ""),
                 clause_reference=exd.get("clause_reference", ""),
                 page_no=str(exd.get("page_no", "") or ""),
@@ -391,7 +472,11 @@ def run_pipeline_task(rfp_id: int, file_path: str, job_id: str):
             )
             db.add(cr)
 
-        # Write DOCX output
+        # ── DOCX output ────────────────────────────────────────────────────────
+        from pathlib import Path as _Path
+        OUTPUT_DIR = _Path("./outputs")
+        OUTPUT_DIR.mkdir(exist_ok=True)
+
         try:
             from output.writer import build_table_rows, fill_ssc1_table
             table_rows = build_table_rows({
@@ -410,21 +495,42 @@ def run_pipeline_task(rfp_id: int, file_path: str, job_id: str):
         except Exception as docx_err:
             print(f"[Pipeline] DOCX output skipped: {docx_err}")
 
-        rfp.status = "completed"
-        rfp.progress = 100
+        # ── Final commit ───────────────────────────────────────────────────────
+        rfp.status       = "completed"
+        rfp.progress     = 100
         rfp.current_step = "Done"
         db.commit()
         print(f"[Pipeline] RFP {rfp_id} completed.")
 
     except Exception as e:
-        db.query(RFP).filter(RFP.id == rfp_id).update({
-            "status": "failed", "error_message": str(e), "current_step": "Failed",
-        })
-        db.commit()
         print(f"[Pipeline] RFP {rfp_id} FAILED: {e}")
+        # Try to mark failed on the main session; if that's dead, open a fresh one.
+        for _session in [db, _fresh_db()]:
+            try:
+                try:
+                    _session.rollback()
+                except Exception:
+                    pass
+                _session.query(RFP).filter(RFP.id == rfp_id).update({
+                    "status":        "failed",
+                    "error_message": str(e),
+                    "current_step":  "Failed",
+                })
+                _session.commit()
+                break   # succeeded — stop trying
+            except Exception as db_err:
+                print(f"[Pipeline] Could not write failed status: {db_err}")
+            finally:
+                if _session is not db:   # don't double-close the main session
+                    try:
+                        _session.close()
+                    except Exception:
+                        pass
     finally:
-        db.close()
-
+        try:
+            db.close()
+        except Exception:
+            pass
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AUTH
@@ -1319,55 +1425,6 @@ def rfp_to_dict(rfp, include_clauses=False, viewer_role="reviewer"):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TQ SERIALISERS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def tq_score_item_to_dict(item) -> dict:
-    try:    strengths = json.loads(item.strengths_json or "[]")
-    except: strengths = []
-    try:    gaps = json.loads(item.gaps_json or "[]")
-    except: gaps = []
-    return {
-        "id":               item.id,
-        "item_code":        item.item_code or "",
-        "parameter":        item.parameter or "",
-        "max_marks":        item.max_marks or 0,
-        "score":            float(item.score or 0),
-        "score_percentage": float(item.score_percentage or 0),
-        "justification":    item.justification or "",
-        "strengths":        strengths,
-        "gaps":             gaps,
-        "evidence_found":   item.evidence_found or False,
-        "is_sub_item":      item.is_sub_item or False,
-        "parent_parameter": item.parent_parameter or "",
-        "criteria_text":    item.criteria_text or "",
-        "sort_order":       item.sort_order or 0,
-    }
-
-
-def tq_evaluation_to_dict(ev, include_scores: bool = True) -> dict:
-    d = {
-        "id":                 ev.id,
-        "rfp_id":             ev.rfp_id,
-        "proposal_file_name": ev.proposal_file_name or "",
-        "evaluation_title":   ev.evaluation_title or "Technical Evaluation",
-        "grand_total_marks":  ev.grand_total_marks or 100,
-        "total_scored":       float(ev.total_scored or 0),
-        "total_percentage":   float(ev.total_percentage or 0),
-        "status":             ev.status or "queued",
-        "progress":           ev.progress or 0,
-        "current_step":       ev.current_step or "",
-        "error_message":      ev.error_message,
-        "uploaded_by_name":   ev.uploader.name if ev.uploader else "",
-        "created_at":         ev.created_at.isoformat() if ev.created_at else None,
-        "completed_at":       ev.completed_at.isoformat() if ev.completed_at else None,
-    }
-    if include_scores:
-        d["scores"] = [tq_score_item_to_dict(s) for s in (ev.scores or [])]
-    return d
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # TQ BACKGROUND TASK
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1375,77 +1432,305 @@ TQ_UPLOAD_DIR = Path("./tq_uploads")
 TQ_UPLOAD_DIR.mkdir(exist_ok=True)
 
 
+import json
+from pathlib import Path
+from datetime import datetime as _dt
+ 
+ 
+import json
+from pathlib import Path
+from datetime import datetime as _dt
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# TQ Serialisers  (replace the existing versions in routes.py)
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+def tq_score_item_to_dict(item) -> dict:
+    try:    strengths = json.loads(item.strengths_json or "[]")
+    except: strengths = []
+    try:    gaps = json.loads(item.gaps_json or "[]")
+    except: gaps = []
+ 
+    raw_score = item.score
+ 
+    # Sentinel values stored in DB:
+    #   "-1"  → pending (live assessment required)
+    #   "-2"  → not_scoreable (financial / comparative)
+    is_pending     = raw_score in ("-1", -1) or getattr(item, "requires_live_assessment", False)
+    is_comparative = raw_score in ("-2", -2) or getattr(item, "requires_comparative_evaluation", False)
+ 
+    score_val = None if (is_pending or is_comparative) else float(raw_score or 0)
+    pct_val   = None if (is_pending or is_comparative) else float(item.score_percentage or 0)
+ 
+    layer = getattr(item, "evaluation_layer", None) or "technical_document"
+    # Back-compat: infer layer from sentinel if column missing
+    if layer == "technical_document":
+        if is_comparative:
+            layer = "financial"
+        elif is_pending and getattr(item, "requires_live_assessment", False):
+            layer = "technical_presentation"
+ 
+    return {
+        "id":                              item.id,
+        "item_code":                       item.item_code or "",
+        "parameter":                       item.parameter or "",
+        "max_marks":                       item.max_marks or 0,
+        "score":                           score_val,
+        "score_percentage":                pct_val,
+        "justification":                   item.justification or "",
+        "strengths":                       strengths,
+        "gaps":                            gaps,
+        "evidence_found":                  item.evidence_found or False,
+        "is_sub_item":                     item.is_sub_item or False,
+        "parent_parameter":                item.parent_parameter or "",
+        "criteria_text":                   item.criteria_text or "",
+        "sort_order":                      item.sort_order or 0,
+        "evaluation_layer":                layer,
+        "requires_live_assessment":        is_pending,
+        "requires_comparative_evaluation": is_comparative,
+    }
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# Evaluation serialiser
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+def tq_evaluation_to_dict(ev, include_scores: bool = True) -> dict:
+    # Safe getattr with defaults for columns added in v3
+    def _g(attr, default=None):
+        return getattr(ev, attr, default)
+ 
+    # Parse qualification JSON
+    qualification = None
+    try:
+        raw_q = _g("qualification_json")
+        if raw_q:
+            qualification = json.loads(raw_q)
+    except Exception:
+        pass
+ 
+    # Parse financial evaluation JSON
+    financial_evaluation = None
+    try:
+        raw_fe = _g("financial_methodology_json")
+        if raw_fe:
+            financial_evaluation = json.loads(raw_fe)
+    except Exception:
+        pass
+ 
+    total_scored_raw = ev.total_scored or "0"
+    total_pct_raw    = ev.total_percentage or "0"
+    total_scored_val = float(total_scored_raw) if total_scored_raw not in ("-1", None) else 0.0
+    total_pct_val    = float(total_pct_raw)    if total_pct_raw    not in ("-1", None) else 0.0
+ 
+    d = {
+        "id":                     ev.id,
+        "rfp_id":                 ev.rfp_id,
+        "proposal_file_name":     ev.proposal_file_name or "",
+        "evaluation_title":       ev.evaluation_title or "Technical Evaluation",
+        "grand_total_marks":      ev.grand_total_marks or 100,
+ 
+        # Three-layer breakdown
+        "technical_document_max": _g("scoreable_total", 0) or 0,
+        "live_assessment_marks":  _g("live_assessment_marks", 0) or 0,
+        "financial_marks":        _g("financial_marks", 0) or 0,
+ 
+        # What we can score from the document
+        "total_scored":           total_scored_val,
+        "total_percentage":       total_pct_val,   # over technical_document_max only
+ 
+        # Formula + qualification
+        "final_score_formula":    _g("final_score_formula"),
+        "financial_evaluation":   financial_evaluation,
+        "qualification":          qualification,
+ 
+        # Schema quality
+        "schema_valid":           _g("schema_valid"),
+        "schema_warning":         _g("schema_warning"),
+ 
+        # Pipeline state
+        "status":                 ev.status or "queued",
+        "progress":               ev.progress or 0,
+        "current_step":           ev.current_step or "",
+        "error_message":          ev.error_message,
+        "uploaded_by_name":       ev.uploader.name if ev.uploader else "",
+        "created_at":             ev.created_at.isoformat() if ev.created_at else None,
+        "completed_at":           ev.completed_at.isoformat() if ev.completed_at else None,
+    }
+    if include_scores:
+        d["scores"] = [tq_score_item_to_dict(s) for s in (ev.scores or [])]
+    return d
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# Background task
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+TQ_UPLOAD_DIR = Path("./tq_uploads")
+TQ_UPLOAD_DIR.mkdir(exist_ok=True)
+ 
+ 
 def run_tq_evaluation_task(tq_eval_id: int, rfp_doc_name: str,
                             proposal_path: str, proposal_doc_name: str):
-    """Background task: full TQ evaluation pipeline."""
+    """
+    Background task: full TQ evaluation pipeline (v5, three-layer aware).
+ 
+    Session lifecycle mirrors the robust pattern from run_pipeline_task:
+      - Short-lived sessions for progress updates
+      - No open DB session during Ollama calls
+      - Final session only for persistence
+    """
     from database import SessionLocal, TQEvaluation, TQScoreItem
-    from core.tq_extractor import run_tq_evaluation
-    from datetime import datetime as _dt
-
+    from core.tq_extractor import run_tq_evaluation   # v5
+ 
+    # ── Mark as processing ────────────────────────────────────────────────────
     db = SessionLocal()
     try:
         ev = db.query(TQEvaluation).filter(TQEvaluation.id == tq_eval_id).first()
         if not ev:
             return
-
         ev.status = "processing"
         db.commit()
-
-        def _progress(step, pct):
-            ev.current_step = step
-            ev.progress = pct
-            db.commit()
-
+    finally:
+        db.close()
+    db = None
+ 
+    # ── Progress callback (short-lived sessions) ──────────────────────────────
+    def _progress(step: str, pct: int):
+        _db = SessionLocal()
+        try:
+            _ev = _db.query(TQEvaluation).filter(TQEvaluation.id == tq_eval_id).first()
+            if _ev:
+                _ev.current_step = step
+                _ev.progress     = pct
+                _db.commit()
+        except Exception:
+            pass
+        finally:
+            try: _db.close()
+            except Exception: pass
+ 
+    # ── Run evaluation (no open DB session) ───────────────────────────────────
+    result = None
+    try:
         result = run_tq_evaluation(
             rfp_doc_name=rfp_doc_name,
             proposal_path=proposal_path,
             proposal_doc_name=proposal_doc_name,
             progress_callback=_progress,
         )
-
-        # Persist scored items
-        for i, scored in enumerate(result.get("scores", [])):
-            item = TQScoreItem(
-                evaluation_id=tq_eval_id,
-                item_code=scored.get("item_code", ""),
-                parameter=scored.get("parameter", ""),
-                max_marks=scored.get("max_marks", 0),
-                score=str(scored.get("score", 0)),
-                score_percentage=str(scored.get("score_percentage", 0)),
-                justification=scored.get("justification", ""),
-                strengths_json=json.dumps(scored.get("strengths", [])),
-                gaps_json=json.dumps(scored.get("gaps", [])),
-                evidence_found=bool(scored.get("evidence_found", False)),
-                is_sub_item=bool(scored.get("is_sub_item", False)),
-                parent_parameter=scored.get("parent_parameter", ""),
-                criteria_text=scored.get("criteria_text", ""),
-                sort_order=i,
-            )
-            db.add(item)
-
-        ev.evaluation_title  = result.get("evaluation_title", "Technical Evaluation")
-        ev.grand_total_marks = result.get("grand_total_marks", 100)
-        ev.total_scored      = str(result.get("total_scored", 0))
-        ev.total_percentage  = str(result.get("total_percentage", 0))
-        ev.status            = "completed"
-        ev.progress          = 100
-        ev.current_step      = "Evaluation complete"
-        ev.completed_at      = _dt.utcnow()
-        ev.error_message     = result.get("error")
-        db.commit()
-        print(f"[TQ] Evaluation {tq_eval_id} done → "
-              f"{ev.total_scored}/{ev.grand_total_marks} ({ev.total_percentage}%)")
-
     except Exception as e:
-        db.query(TQEvaluation).filter(TQEvaluation.id == tq_eval_id).update({
-            "status": "failed",
-            "error_message": str(e),
-            "current_step": "Failed",
-        })
+        print(f"[TQ] run_tq_evaluation raised: {e}")
+        _db = SessionLocal()
+        try:
+            _db.query(TQEvaluation).filter(TQEvaluation.id == tq_eval_id).update({
+                "status": "failed", "error_message": str(e), "current_step": "Failed"})
+            _db.commit()
+        except Exception: pass
+        finally:
+            try: _db.close()
+            except Exception: pass
+        return
+ 
+    # ── Persist results ───────────────────────────────────────────────────────
+    db = SessionLocal()
+    try:
+        ev = db.query(TQEvaluation).filter(TQEvaluation.id == tq_eval_id).first()
+        if not ev:
+            return
+ 
+        for i, scored in enumerate(result.get("scores", [])):
+            layer       = scored.get("evaluation_layer", "technical_document")
+            raw_score   = scored.get("score")
+            is_pending  = scored.get("requires_live_assessment", False) or raw_score is None and layer == "technical_presentation"
+            is_comp     = scored.get("requires_comparative_evaluation", False) or layer == "financial"
+ 
+            # Sentinels: -1 = pending, -2 = comparative/financial
+            if is_comp:
+                stored_score = "-2"
+                stored_pct   = "-2"
+            elif is_pending or raw_score is None:
+                stored_score = "-1"
+                stored_pct   = "-1"
+            else:
+                stored_score = str(raw_score)
+                stored_pct   = str(scored.get("score_percentage", 0))
+ 
+            item = TQScoreItem(
+                evaluation_id    = tq_eval_id,
+                item_code        = scored.get("item_code", ""),
+                parameter        = scored.get("parameter", ""),
+                max_marks        = scored.get("max_marks", 0),
+                score            = stored_score,
+                score_percentage = stored_pct,
+                justification    = scored.get("justification", ""),
+                strengths_json   = json.dumps(scored.get("strengths", [])),
+                gaps_json        = json.dumps(scored.get("gaps", [])),
+                evidence_found   = bool(scored.get("evidence_found", False)),
+                is_sub_item      = bool(scored.get("is_sub_item", False)),
+                parent_parameter = scored.get("parent_parameter", ""),
+                criteria_text    = scored.get("criteria_text", ""),
+                sort_order       = i,
+                requires_live_assessment = is_pending,
+            )
+ 
+            # Attach extra columns if they exist (added by migration)
+            def _set(obj, attr, val):
+                try: setattr(obj, attr, val)
+                except Exception: pass
+ 
+            _set(item, "evaluation_layer",                layer)
+            _set(item, "requires_comparative_evaluation", is_comp)
+ 
+            db.add(item)
+ 
+        # ── Update evaluation record ──────────────────────────────────────────
+        ev.evaluation_title    = result.get("evaluation_title", "Technical Evaluation")
+        ev.grand_total_marks   = result.get("grand_total_marks", 100)
+        ev.total_scored        = str(result.get("total_scored", 0))
+        ev.total_percentage    = str(result.get("total_percentage", 0))
+        ev.status              = "completed"
+        ev.progress            = 100
+        ev.current_step        = "Evaluation complete"
+        ev.completed_at        = _dt.utcnow()
+        ev.error_message       = result.get("error")
+ 
+        def _sev(attr, val):
+            try: setattr(ev, attr, val)
+            except Exception: pass
+ 
+        _sev("scoreable_total",       result.get("technical_document_max", 0))
+        _sev("live_assessment_marks", result.get("live_assessment_marks", 0))
+        _sev("financial_marks",       result.get("financial_marks", 0))
+        _sev("schema_valid",          result.get("schema_valid", False))
+        _sev("schema_warning",        result.get("schema_warning"))
+        _sev("final_score_formula",   result.get("final_score_formula"))
+        _sev("financial_methodology_json",
+             json.dumps(result.get("financial_evaluation") or {}))
+        _sev("qualification_json",
+             json.dumps(result.get("qualification") or {}))
+ 
         db.commit()
-        print(f"[TQ] Evaluation {tq_eval_id} FAILED: {e}")
+ 
+        td_max = result.get("technical_document_max", ev.grand_total_marks)
+        print(f"[TQ] Evaluation {tq_eval_id} done → "
+              f"Technical(doc): {ev.total_scored}/{td_max} ({ev.total_percentage}%) | "
+              f"Live: {result.get('live_assessment_marks', 0)} marks pending | "
+              f"Financial: {result.get('financial_marks', 0)} marks comparative | "
+              f"fin_opens={result.get('qualification', {}).get('financial_bid_opens')}")
+ 
+    except Exception as e:
+        print(f"[TQ] Persist failed for evaluation {tq_eval_id}: {e}")
+        try:
+            db.query(TQEvaluation).filter(TQEvaluation.id == tq_eval_id).update({
+                "status": "failed", "error_message": str(e), "current_step": "Failed"})
+            db.commit()
+        except Exception: pass
     finally:
-        db.close()
+        try: db.close()
+        except Exception: pass
+ 
+ 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1460,21 +1745,13 @@ async def upload_tq_proposal(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_tq_or_admin),
 ):
-    """
-    Upload a proposal for TQ evaluation.
-    Access: admin, tq_reviewer
-
-    The RFP must already be processed (its document already in ChromaDB)
-    so the scoring criteria can be extracted from it.
-    """
     rfp = db.query(RFP).filter(RFP.id == rfp_id).first()
     if not rfp:
         raise HTTPException(404, "RFP not found")
     if rfp.status not in ("completed", "failed"):
         raise HTTPException(400, "RFP must finish processing before uploading a proposal.")
-
+ 
     form = await request.form()
-
     file_obj = (form.get("file") or form.get("proposal")
                 or form.get("proposal_file") or form.get("document"))
     if file_obj is None:
@@ -1485,22 +1762,21 @@ async def upload_tq_proposal(
                 break
     if file_obj is None:
         raise HTTPException(400, "No proposal file in upload.")
-
+ 
     ext = Path(file_obj.filename).suffix.lower()
     if ext not in (".pdf", ".docx", ".doc"):
         raise HTTPException(400, "Only PDF and DOCX are supported.")
-
-    proposal_uid = str(uuid.uuid4())[:8]
+ 
+    proposal_uid      = str(uuid.uuid4())[:8]
     proposal_doc_name = f"proposal_{rfp.job_id}_{proposal_uid}{ext}"
-    save_path = TQ_UPLOAD_DIR / proposal_doc_name
-
+    save_path         = TQ_UPLOAD_DIR / proposal_doc_name
+ 
     with open(save_path, "wb") as fp:
         fp.write(await file_obj.read())
-
-    # Reconstruct the RFP's ChromaDB doc_name (same logic as run_pipeline_task)
+ 
     original_ext = Path(rfp.file_name).suffix if rfp.file_name else ".pdf"
     rfp_doc_name = f"{rfp.job_id}{original_ext}"
-
+ 
     ev = TQEvaluation(
         rfp_id=rfp_id,
         proposal_file_name=file_obj.filename,
@@ -1509,6 +1785,9 @@ async def upload_tq_proposal(
         grand_total_marks=100,
         total_scored="0",
         total_percentage="0",
+        scoreable_total=0,
+        live_assessment_marks=0,
+        schema_valid=False,
         status="queued",
         progress=0,
         current_step="Queued — waiting to start",
@@ -1517,7 +1796,7 @@ async def upload_tq_proposal(
     db.add(ev)
     db.commit()
     db.refresh(ev)
-
+ 
     background_tasks.add_task(
         run_tq_evaluation_task,
         ev.id,
@@ -1525,44 +1804,66 @@ async def upload_tq_proposal(
         str(save_path),
         proposal_doc_name,
     )
-
+ 
     return {
-        "tq_evaluation_id": ev.id,
-        "rfp_id": rfp_id,
+        "tq_evaluation_id":   ev.id,
+        "rfp_id":             rfp_id,
         "proposal_file_name": file_obj.filename,
-        "status": "queued",
-        "message": "Proposal uploaded. TQ evaluation started in background.",
+        "status":             "queued",
+        "message":            "Proposal uploaded. TQ evaluation started in background.",
     }
-
-
+ 
+ 
 @router.get("/rfps/{rfp_id}/tq")
 def get_tq_evaluations(
     rfp_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_tq_access),
 ):
-    """
-    Get all TQ evaluations for an RFP. Returns latest first.
-    Access: admin, reviewer, tq_reviewer
-    """
     if not db.query(RFP).filter(RFP.id == rfp_id).first():
         raise HTTPException(404, "RFP not found")
-
     evaluations = (
         db.query(TQEvaluation)
         .filter(TQEvaluation.rfp_id == rfp_id)
         .order_by(TQEvaluation.created_at.desc())
         .all()
     )
-
     return {
         "rfp_id": rfp_id,
         "total_evaluations": len(evaluations),
-        "evaluations": [tq_evaluation_to_dict(ev, include_scores=False) for ev in evaluations],
+        "evaluations": [tq_evaluation_to_dict(ev, include_scores=False)
+                        for ev in evaluations],
         "latest": tq_evaluation_to_dict(evaluations[0]) if evaluations else None,
     }
-
-
+ 
+ 
+def build_tq_status_response(ev) -> dict:
+    qualification = None
+    try:
+        raw_q = getattr(ev, "qualification_json", None)
+        if raw_q:
+            qualification = json.loads(raw_q)
+    except Exception:
+        pass
+    return {
+        "id":                     ev.id,
+        "status":                 ev.status,
+        "progress":               ev.progress,
+        "current_step":           ev.current_step,
+        "error_message":          ev.error_message,
+        "total_scored":           float(ev.total_scored or 0),
+        "total_percentage":       float(ev.total_percentage or 0),
+        "grand_total_marks":      ev.grand_total_marks,
+        "technical_document_max": getattr(ev, "scoreable_total", 0) or 0,
+        "live_assessment_marks":  getattr(ev, "live_assessment_marks", 0) or 0,
+        "financial_marks":        getattr(ev, "financial_marks", 0) or 0,
+        "final_score_formula":    getattr(ev, "final_score_formula", None),
+        "schema_valid":           getattr(ev, "schema_valid", None),
+        "qualification":          qualification,
+        "financial_bid_opens":    (qualification or {}).get("financial_bid_opens"),
+    }
+ 
+ 
 @router.get("/rfps/{rfp_id}/tq/{evaluation_id}")
 def get_tq_evaluation_detail(
     rfp_id: int,
@@ -1570,10 +1871,6 @@ def get_tq_evaluation_detail(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_tq_access),
 ):
-    """
-    Full TQ evaluation detail with all scored criteria.
-    Access: admin, reviewer, tq_reviewer
-    """
     ev = db.query(TQEvaluation).filter(
         TQEvaluation.id == evaluation_id,
         TQEvaluation.rfp_id == rfp_id,
@@ -1581,8 +1878,8 @@ def get_tq_evaluation_detail(
     if not ev:
         raise HTTPException(404, "TQ evaluation not found")
     return tq_evaluation_to_dict(ev, include_scores=True)
-
-
+ 
+ 
 @router.get("/rfps/{rfp_id}/tq/{evaluation_id}/status")
 def get_tq_status(
     rfp_id: int,
@@ -1590,7 +1887,6 @@ def get_tq_status(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_tq_access),
 ):
-    """Poll status of a running TQ evaluation."""
     ev = db.query(TQEvaluation).filter(
         TQEvaluation.id == evaluation_id,
         TQEvaluation.rfp_id == rfp_id,
@@ -1598,17 +1894,20 @@ def get_tq_status(
     if not ev:
         raise HTTPException(404, "TQ evaluation not found")
     return {
-        "id":               ev.id,
-        "status":           ev.status,
-        "progress":         ev.progress,
-        "current_step":     ev.current_step,
-        "error_message":    ev.error_message,
-        "total_scored":     float(ev.total_scored or 0),
-        "total_percentage": float(ev.total_percentage or 0),
-        "grand_total_marks": ev.grand_total_marks,
+        "id":                    ev.id,
+        "status":                ev.status,
+        "progress":              ev.progress,
+        "current_step":          ev.current_step,
+        "error_message":         ev.error_message,
+        "total_scored":          float(ev.total_scored or 0),
+        "total_percentage":      float(ev.total_percentage or 0),
+        "grand_total_marks":     ev.grand_total_marks,
+        "scoreable_total":       getattr(ev, "scoreable_total", 0) or 0,
+        "live_assessment_marks": getattr(ev, "live_assessment_marks", 0) or 0,
+        "schema_valid":          getattr(ev, "schema_valid", None),
     }
-
-
+ 
+ 
 @router.patch("/rfps/{rfp_id}/tq/{evaluation_id}/scores/{score_id}")
 async def override_tq_score(
     rfp_id: int,
@@ -1618,65 +1917,64 @@ async def override_tq_score(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_tq_access),
 ):
-    """
-    Manually override a score with a reason. Recalculates total.
-    Access: admin, reviewer, tq_reviewer
-    Body: { "score": 15.0, "override_reason": "CV on page 12 confirms 8 eligible assignments" }
-    """
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(400, "Invalid JSON body")
-
+ 
     item = db.query(TQScoreItem).filter(
         TQScoreItem.id == score_id,
         TQScoreItem.evaluation_id == evaluation_id,
     ).first()
     if not item:
         raise HTTPException(404, "Score item not found")
-
+ 
     ev = db.query(TQEvaluation).filter(
         TQEvaluation.id == evaluation_id,
         TQEvaluation.rfp_id == rfp_id,
     ).first()
     if not ev:
         raise HTTPException(404, "Evaluation not found")
-
+ 
     new_score = float(body.get("score", item.score or 0))
     if new_score < 0 or new_score > (item.max_marks or 0):
         raise HTTPException(400, f"Score must be 0–{item.max_marks}")
-
-    item.score = str(round(new_score, 1))
+ 
+    item.score            = str(round(new_score, 1))
     item.score_percentage = str(
         round((new_score / item.max_marks) * 100, 1) if item.max_marks else 0
     )
-
+    item.requires_live_assessment = False  # override clears pending status
+ 
     override_reason = body.get("override_reason", "")
     if override_reason:
-        item.justification = (
-            f"[MANUALLY OVERRIDDEN by {current_user.name}] {override_reason}"
-        )
-
-    # Recompute total
+        item.justification = f"[MANUALLY OVERRIDDEN by {current_user.name}] {override_reason}"
+ 
+    # Recompute evaluation total (only scored, non-pending items)
     db.flush()
     all_scores = db.query(TQScoreItem).filter(
         TQScoreItem.evaluation_id == evaluation_id
     ).all()
-    new_total = sum(float(s.score or 0) for s in all_scores)
+    new_total = sum(
+        float(s.score or 0)
+        for s in all_scores
+        if s.score not in ("-1", None)
+    )
     ev.total_scored     = str(round(new_total, 1))
+    scoreable            = sum(s.max_marks for s in all_scores if s.score not in ("-1", None))
     ev.total_percentage = str(
-        round((new_total / (ev.grand_total_marks or 100)) * 100, 1)
+        round((new_total / scoreable) * 100, 1) if scoreable else 0
     )
     db.commit()
-
+ 
     return {
-        "updated_score":         tq_score_item_to_dict(item),
-        "new_total_scored":      float(ev.total_scored),
-        "new_total_percentage":  float(ev.total_percentage),
-        "grand_total_marks":     ev.grand_total_marks,
+        "updated_score":        tq_score_item_to_dict(item),
+        "new_total_scored":     float(ev.total_scored),
+        "new_total_percentage": float(ev.total_percentage),
+        "grand_total_marks":    ev.grand_total_marks,
     }
-
-
+ 
+ 
 @router.delete("/rfps/{rfp_id}/tq/{evaluation_id}")
 def delete_tq_evaluation(
     rfp_id: int,
@@ -1684,7 +1982,6 @@ def delete_tq_evaluation(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    """Admin: delete a TQ evaluation and all its score items."""
     ev = db.query(TQEvaluation).filter(
         TQEvaluation.id == evaluation_id,
         TQEvaluation.rfp_id == rfp_id,
@@ -1694,8 +1991,8 @@ def delete_tq_evaluation(
     db.delete(ev)
     db.commit()
     return {"deleted": True, "evaluation_id": evaluation_id}
-
-
+ 
+ 
 @router.get("/tq/evaluations")
 def list_all_tq_evaluations(
     status: Optional[str] = Query(None),
@@ -1703,10 +2000,8 @@ def list_all_tq_evaluations(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    """Admin: list all TQ evaluations across all RFPs."""
     q = db.query(TQEvaluation)
     if status:
         q = q.filter(TQEvaluation.status == status)
     evs = q.order_by(TQEvaluation.created_at.desc()).limit(limit).all()
     return [tq_evaluation_to_dict(ev, include_scores=False) for ev in evs]
-

@@ -2,24 +2,42 @@
 Clause Extractor
 ----------------
 Uses Ollama (local, free) to extract structured data from RFP clause text.
-The LLM extracts FACTS. The risk_engine.py evaluates RISK.
 
-LEARNING LOOP INTEGRATION
---------------------------
-extract_clause() now accepts an optional `learning_context` string.
-When provided (by the pipeline, which queries the LearningStore), this
-block of past reviewer corrections is appended to the prompt BEFORE the
-extraction instruction. The LLM sees examples of what it got wrong for
-this specific offering/solution and corrects its pattern in-context.
+WINDOWS FIX
+-----------
+The ollama Python client (0.2.1) uses httpx internally. On Windows, httpx
+can stall indefinitely waiting for a socket close signal even after the full
+response body has been received. This manifests as the pipeline hanging after
+"[N/10] Extracting: <clause>..." with no further output.
 
-This is few-shot prompting — no fine-tuning, no weight updates. Works with
-any Ollama model. The effect compounds: more feedback → richer examples →
-more accurate extraction and risk characterisation.
+Fix: call Ollama's REST API directly via `requests` (standard library HTTP
+client that handles Windows sockets reliably) with an explicit timeout.
+The ollama import is kept only for the ResponseError type; the actual HTTP
+call no longer goes through ollama.Client.chat().
+
+DB SESSION FIX (v2)
+-------------------
+Root cause of the SSL-connection-closed cascade:
+  1. Pipeline opens a DB session and holds it open.
+  2. A long Ollama call (sometimes 300–600 s) occupies the thread.
+  3. Neon's serverless proxy silently drops idle TCP connections after ~5 min.
+  4. The DB session now holds a dead socket.
+  5. The next query (build_fewshot_context) raises OperationalError.
+  6. SQLAlchemy puts the session into a "transaction failed" state.
+  7. Rollback also fails (dead socket) → session is permanently broken.
+  8. Every subsequent query in the same session raises
+     "Can't reconnect until invalid transaction is rolled back".
+  9. db.close() at the end raises the same error → uvicorn logs ASGI error.
+
+Fix: extract_all_clauses now opens a *fresh*, short-lived DB session for
+each learning-context lookup. The short session is closed immediately after
+the query, so it is never held open during an Ollama call. The caller's
+session (used for RFP state updates) is never touched here.
 """
 
 import json
 import re
-import ollama
+import requests
 from typing import Optional
 from core.vector_store import retrieve
 
@@ -28,8 +46,14 @@ from core.vector_store import retrieve
 # Config
 # ──────────────────────────────────────────────────────────────────────────────
 
-OLLAMA_MODEL = "llama3.2"
-OLLAMA_HOST  = "http://localhost:11434"
+OLLAMA_MODEL    = "llama3.2"
+OLLAMA_HOST     = "http://localhost:11434"
+OLLAMA_CHAT_URL = f"{OLLAMA_HOST}/api/chat"
+# 10 minutes — generous ceiling for a slow CPU / large context window.
+# The previous 300 s limit caused ReadTimeout on the liability clause of several
+# RFPs. Even if this is hit, the error is caught and the clause is skipped
+# gracefully; the pipeline does NOT crash.
+OLLAMA_TIMEOUT  = 600
 
 GTBL_CONTEXT = """
 IMPORTANT CONTEXT ABOUT GTBL (the bidding firm):
@@ -308,7 +332,7 @@ def _clean_json(text: str) -> str:
     text = text.strip("`").strip()
     start = text.find("{")
     if start < 0:
-        return text
+        return ""
     depth = 0
     in_string = False
     escape = False
@@ -329,12 +353,72 @@ def _clean_json(text: str) -> str:
         elif ch == "}":
             depth -= 1
             if depth == 0:
-                return text[start:i+1]
+                raw = text[start:i + 1]
+                raw = re.sub(r",\s*([}\]])", r"\1", raw)
+                return raw
     return text[start:]
 
 
+def _call_ollama(model: str, prompt: str) -> str:
+    """
+    Direct REST call to Ollama — bypasses the ollama Python client entirely.
+
+    Uses `requests` which handles Windows socket behaviour correctly and
+    respects the explicit timeout. Returns the raw text content string,
+    or raises requests.RequestException / ValueError on failure.
+    """
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "options": {"temperature": 0.0,"num_ctx": 2048,},
+    }
+    resp = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=OLLAMA_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["message"]["content"]
+
+
+def _get_learning_context(
+    clause_type: str,
+    offering: str,
+    solution: str,
+) -> str:
+    """
+    Open a *fresh* short-lived DB session, query learning examples, close it.
+
+    This is the key fix: we never hold a DB connection open across an Ollama
+    call. Each call to this helper creates and destroys its own connection,
+    so a stale Neon socket can never poison the main pipeline session.
+
+    Returns empty string on any failure (learning context is optional).
+    """
+    from database import SessionLocal
+    from rules.learning_store import build_fewshot_context
+
+    db = SessionLocal()
+    try:
+        ctx = build_fewshot_context(
+            clause_type=clause_type,
+            offering=offering,
+            solution=solution,
+            db=db,
+        )
+        return ctx or ""
+    except Exception as e:
+        print(f"    [Learning] context skipped ({clause_type}): {e}")
+        return ""
+    finally:
+        # Always close, even if an exception occurred inside the query.
+        # pool_pre_ping will give the next caller a fresh connection.
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Core extractor — now accepts learning_context
+# Core extractor
 # ──────────────────────────────────────────────────────────────────────────────
 
 def extract_clause(
@@ -342,31 +426,14 @@ def extract_clause(
     doc_name: str,
     top_k: int = 6,
     model: str = OLLAMA_MODEL,
-    learning_context: str = "",       # ← NEW: injected few-shot corrections
+    learning_context: str = "",
 ) -> dict:
-    """
-    Full RAG + LLM extraction pipeline for a single clause type.
-
-    learning_context: optional block returned by LearningStore.build_fewshot_context().
-    When non-empty it is injected into the prompt so the LLM can correct
-    known patterns for this offering/solution combination.
-
-    Returns dict:
-    {
-        "clause_type":       str,
-        "doc_name":          str,
-        "retrieved_chunks":  [...],
-        "extracted":         {...},
-        "error":             str or None,
-        "learning_applied":  bool,      ← NEW
-    }
-    """
     if clause_type not in EXTRACTION_PROMPTS:
         raise ValueError(f"Unknown clause type '{clause_type}'.")
 
     # ── Step 1: Multi-query RAG retrieval ──────────────────────────────────────
-    queries = RAG_QUERIES.get(clause_type, [clause_type])
-    seen_ids = set()
+    queries    = RAG_QUERIES.get(clause_type, [clause_type])
+    seen_ids   = set()
     all_chunks = []
 
     for query in queries:
@@ -385,7 +452,11 @@ def extract_clause(
             "clause_type": clause_type,
             "doc_name": doc_name,
             "retrieved_chunks": [],
-            "extracted": {"clause_text": None, "clause_reference": "Not found", "page_no": None},
+            "extracted": {
+                "clause_text": None,
+                "clause_reference": "Not found",
+                "page_no": None,
+            },
             "error": "No relevant chunks found in document.",
             "learning_applied": False,
         }
@@ -398,9 +469,8 @@ def extract_clause(
         )
     context = "\n\n---\n\n".join(context_parts)
 
-    # ── Step 3: Build prompt with optional learning context ────────────────────
+    # ── Step 3: Build prompt ───────────────────────────────────────────────────
     prompt_template = EXTRACTION_PROMPTS[clause_type]
-
     if clause_type == "eligibility":
         prompt = prompt_template.format(
             context=context,
@@ -413,33 +483,61 @@ def extract_clause(
             learning_context=learning_context,
         )
 
-    # ── Step 4: Call Ollama ────────────────────────────────────────────────────
+    # ── Step 4: Call Ollama via direct REST (Windows-safe) ────────────────────
     try:
-        client = ollama.Client(host=OLLAMA_HOST)
-        response = client.chat(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0.0},
-        )
-        raw_output = response["message"]["content"]
-        json_str   = _clean_json(raw_output)
-        extracted  = json.loads(json_str)
-
-    except ollama.ResponseError as e:
+        raw_output = _call_ollama(model, prompt)
+    except Exception as e:
         return {
             "clause_type": clause_type,
             "doc_name": doc_name,
             "retrieved_chunks": all_chunks,
-            "extracted": {"clause_text": None, "clause_reference": "LLM Error"},
-            "error": f"Ollama error: {e}",
+            "extracted": {
+                "clause_text": None,
+                "clause_reference": "Ollama error",
+            },
+            "error": f"{type(e).__name__}: {e}",
             "learning_applied": bool(learning_context),
         }
+
+    if not raw_output or not raw_output.strip():
+        return {
+            "clause_type": clause_type,
+            "doc_name": doc_name,
+            "retrieved_chunks": all_chunks,
+            "extracted": {
+                "clause_text": None,
+                "clause_reference": "Empty LLM response",
+            },
+            "error": "Ollama returned an empty response.",
+            "learning_applied": bool(learning_context),
+        }
+
+    json_str = _clean_json(raw_output)
+
+    if not json_str:
+        return {
+            "clause_type": clause_type,
+            "doc_name": doc_name,
+            "retrieved_chunks": all_chunks,
+            "extracted": {
+                "clause_text": raw_output[:500],
+                "clause_reference": "No JSON in response",
+            },
+            "error": f"No JSON object found in LLM response: {raw_output[:200]}",
+            "learning_applied": bool(learning_context),
+        }
+
+    try:
+        extracted = json.loads(json_str)
     except json.JSONDecodeError as e:
         return {
             "clause_type": clause_type,
             "doc_name": doc_name,
             "retrieved_chunks": all_chunks,
-            "extracted": {"clause_text": raw_output, "clause_reference": "JSON parse error"},
+            "extracted": {
+                "clause_text": raw_output[:500],
+                "clause_reference": "JSON parse error",
+            },
             "error": f"Could not parse LLM output as JSON: {e}",
             "learning_applied": bool(learning_context),
         }
@@ -459,42 +557,39 @@ def extract_all_clauses(
     model: str = OLLAMA_MODEL,
     offering: str = "",
     solution: str = "",
-    db=None,                  # ← NEW: pass DB session to enable learning injection
+    db=None,          # kept for API compatibility but NO LONGER USED for queries
 ) -> dict:
     """
     Run extraction for all 10 clause types.
 
-    If `db` is provided along with offering/solution, the LearningStore
-    is queried for each clause type and few-shot correction examples are
-    injected into the LLM prompt automatically.
+    Learning context is fetched via _get_learning_context(), which opens and
+    closes its own fresh DB session for each clause. This means no DB
+    connection is ever held open while Ollama is thinking, eliminating the
+    SSL-drop cascade entirely.
+
+    The `db` parameter is accepted for backward compatibility but is ignored.
+    Callers do not need to change their call signature.
     """
     if not model:
         model = OLLAMA_MODEL
 
-    results = {}
+    results      = {}
     clause_types = list(EXTRACTION_PROMPTS.keys())
+    use_learning = bool(offering or solution)
 
     print(f"\n[Extractor] Processing {len(clause_types)} clauses for '{doc_name}'...")
-    if db and (offering or solution):
-        print(f"  [Learning] Injecting few-shot context for: {offering!r} / {solution!r}")
+    if use_learning:
+        print(f"  [Learning] Will inject few-shot context for: {offering!r} / {solution!r}")
 
     for i, ctype in enumerate(clause_types, 1):
-        # ── Build learning context if DB session available ──────────────────
+        # ── Fetch learning context with its own isolated session ──────────────
         learning_ctx = ""
-        if db and (offering or solution):
-            try:
-                from rules.learning_store import build_fewshot_context
-                learning_ctx = build_fewshot_context(
-                    clause_type=ctype,
-                    offering=offering,
-                    solution=solution,
-                    db=db,
-                )
-                if learning_ctx:
-                    print(f"    [{i}/{len(clause_types)}] {ctype}: few-shot context injected ✓")
-            except Exception as le:
-                print(f"    [{i}/{len(clause_types)}] {ctype}: learning context skipped — {le}")
+        if use_learning:
+            learning_ctx = _get_learning_context(ctype, offering, solution)
+            if learning_ctx:
+                print(f"    [{i}/{len(clause_types)}] {ctype}: few-shot context injected ✓")
 
+        # ── Run LLM extraction (no DB connection held during this call) ────────
         print(f"  [{i}/{len(clause_types)}] Extracting: {ctype}...")
         results[ctype] = extract_clause(
             ctype, doc_name, model=model, learning_context=learning_ctx

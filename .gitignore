@@ -10,3 +10,4 @@ __pycache__/
 *.bak 
 debug_*.py 
 fix_*.py 
+.env 
