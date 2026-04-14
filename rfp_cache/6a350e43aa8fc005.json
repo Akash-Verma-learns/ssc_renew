@@ -1,0 +1,243 @@
+{
+  "rfp_hash": "6a350e43aa8fc005",
+  "rfp_filename": "0c5800be.pdf",
+  "cached_at": "2026-04-14T13:13:06",
+  "grand_total": 130,
+  "live_marks": 30,
+  "live_label": "Technical Presentations by Bidder",
+  "doc_total": 100,
+  "threshold": 0.7,
+  "criteria": [
+    {
+      "item_code": "1",
+      "parameter": "Financial Turnover",
+      "max_marks": 15,
+      "formula_type": "BAND",
+      "criteria_text": "100-200 Crs : 5 marks, 200-300 Crs : 10 marks, 300 Crs + : 15 marks",
+      "search_keywords": [
+        "Financial Turnover",
+        "Annual Average Turnover"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": false
+    },
+    {
+      "item_code": "2",
+      "parameter": "Area of Experience",
+      "max_marks": 10,
+      "formula_type": "BAND",
+      "criteria_text": "3 - 4 years of Experience: 4 marks, 5 - 6 years of Experience: 7 marks, 6 + years of Experience: 10 marks",
+      "search_keywords": [
+        "Area of Experience",
+        "Project Management Unit",
+        "Skill Development"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": false
+    },
+    {
+      "item_code": "3",
+      "parameter": "Handling Large Scale Projects",
+      "max_marks": 15,
+      "formula_type": "BAND",
+      "criteria_text": "Handling 3 large scale project – 5 marks, Handling 4 large scale project -10 marks, Handling more than 4 large scale project- 15 marks",
+      "search_keywords": [
+        "Handling Large Scale Projects",
+        "PMU/PMC/TSA"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": false
+    },
+    {
+      "item_code": "4",
+      "parameter": "Manpower Consulting Staff",
+      "max_marks": 10,
+      "formula_type": "BAND",
+      "criteria_text": "500 to 1000 - 5 marks, More than 1000 – 10 marks",
+      "search_keywords": [
+        "Manpower Consulting Staff",
+        "Technically Qualified Personnel"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": false
+    },
+    {
+      "item_code": "5",
+      "parameter": "DDU-GKY Experience",
+      "max_marks": 20,
+      "formula_type": "BAND",
+      "criteria_text": "1 to 4 projects: 5 marks, More than 4 projects: 10 marks, One or more project – 10 marks",
+      "search_keywords": [
+        "DDU-GKY Experience",
+        "Technical Support Agency"
+      ],
+      "sub_criteria": [],
+      "is_parent": true,
+      "is_sub_item": false
+    },
+    {
+      "item_code": "5a",
+      "parameter": "DDU-GKY Projects",
+      "max_marks": 10,
+      "formula_type": "BAND",
+      "criteria_text": "1 to 4 projects: 5 marks, More than 4 projects: 10 marks",
+      "search_keywords": [
+        "DDU-GKY Projects"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": true,
+      "parent_parameter": "DDU-GKY Experience"
+    },
+    {
+      "item_code": "5b",
+      "parameter": "Skill Development Program",
+      "max_marks": 10,
+      "formula_type": "BINARY",
+      "criteria_text": "One or more project – 10 marks",
+      "search_keywords": [
+        "Skill Development Program",
+        "Maharashtra"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": true,
+      "parent_parameter": "DDU-GKY Experience"
+    },
+    {
+      "item_code": "6",
+      "parameter": "Other Support Activities",
+      "max_marks": 30,
+      "formula_type": "BAND",
+      "criteria_text": "Information, Education and Communication, Alumni Support, Capacity Building, Job Mela etc.",
+      "search_keywords": [
+        "Other Support Activities",
+        "Information, Education and Communication",
+        "Alumni Support",
+        "Capacity Building",
+        "Job Mela"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": false
+    }
+  ],
+  "bands": {
+    "Financial Turnover": {
+      "formula_type": "BAND",
+      "bands": [
+        {
+          "min": 100,
+          "max": 200,
+          "score": 5
+        },
+        {
+          "min": 200,
+          "max": 300,
+          "score": 10
+        },
+        {
+          "min": 300,
+          "max": null,
+          "score": 15
+        }
+      ],
+      "present_score": null,
+      "absent_score": 0,
+      "notes": ""
+    },
+    "Area of Experience": {
+      "formula_type": "BAND",
+      "bands": [
+        {
+          "min": 3,
+          "max": 5,
+          "score": 4
+        },
+        {
+          "min": 5,
+          "max": 6,
+          "score": 7
+        },
+        {
+          "min": 6,
+          "max": null,
+          "score": 10
+        }
+      ],
+      "present_score": null,
+      "absent_score": 0,
+      "notes": ""
+    },
+    "Handling Large Scale Projects": {
+      "formula_type": "BAND",
+      "bands": [
+        {
+          "min": 3,
+          "max": 4,
+          "score": 5
+        },
+        {
+          "min": 4,
+          "max": null,
+          "score": 10
+        },
+        {
+          "min": 5,
+          "max": null,
+          "score": 15
+        }
+      ],
+      "present_score": null,
+      "absent_score": 0,
+      "notes": "Handling of large scale projects with scores for 3, 4, and more than 4 projects"
+    },
+    "Manpower Consulting Staff": {
+      "formula_type": "BAND",
+      "bands": [
+        {
+          "min": 500,
+          "max": 1000,
+          "score": 5
+        },
+        {
+          "min": 1000,
+          "max": null,
+          "score": 10
+        }
+      ],
+      "present_score": null,
+      "absent_score": 0,
+      "notes": ""
+    },
+    "DDU-GKY Projects": {
+      "formula_type": "BAND",
+      "bands": [
+        {
+          "min": 1,
+          "max": 4,
+          "score": 5
+        },
+        {
+          "min": 5,
+          "max": null,
+          "score": 10
+        }
+      ],
+      "present_score": null,
+      "absent_score": 0,
+      "notes": ""
+    },
+    "Skill Development Program": {
+      "formula_type": "BINARY",
+      "bands": [],
+      "present_score": 10,
+      "absent_score": 0
+    }
+  },
+  "context_source": "p16-p21"
+}

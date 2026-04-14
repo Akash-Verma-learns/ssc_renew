@@ -1,0 +1,409 @@
+{
+  "rfp_hash": "f6beb6db05e6a008",
+  "rfp_filename": "1e06972f.pdf",
+  "cached_at": "2026-04-14T13:41:39",
+  "grand_total": 100,
+  "live_marks": 20,
+  "live_label": "Presentation by the bidder",
+  "doc_total": 80,
+  "threshold": 70.0,
+  "criteria": [
+    {
+      "item_code": "1",
+      "parameter": "Turnover",
+      "max_marks": 15,
+      "formula_type": "BAND",
+      "criteria_text": "1. Turnover -100 Cr. =5 marks, 2. For every additional 10 Cr.= 0.5 marks",
+      "search_keywords": [
+        "Turnover",
+        "Average Turnover",
+        "Financial Years"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": false
+    },
+    {
+      "item_code": "2",
+      "parameter": "Past Experience A",
+      "max_marks": 20,
+      "formula_type": "BAND",
+      "criteria_text": "Single order of 06 professionals : 10 marks, Single order of more than 06- and up-to 12 professionals : 15 marks, Single order of more than 12 professionals : 20 marks",
+      "search_keywords": [
+        "Past Experience",
+        "Advisory",
+        "Consulting Services"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": false
+    },
+    {
+      "item_code": "3",
+      "parameter": "Past Experience B",
+      "max_marks": 20,
+      "formula_type": "BAND",
+      "criteria_text": "5 marks for 01 project with maximum of 20 marks",
+      "search_keywords": [
+        "Past Experience",
+        "Thematic Sectoral Projects",
+        "Urban Development"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": false
+    },
+    {
+      "item_code": "4",
+      "parameter": "Qualifications and Competence of Staff Members",
+      "max_marks": 25,
+      "formula_type": "QUAL",
+      "criteria_text": "Educational Qualification - 25%, No of Years of relevant experience - 25%, No. of relevant projects undertaken – 50% marks",
+      "search_keywords": [
+        "Qualifications",
+        "Competence",
+        "Staff Members"
+      ],
+      "sub_criteria": [],
+      "is_parent": true,
+      "is_sub_item": false
+    },
+    {
+      "item_code": "4a",
+      "parameter": "Team Leader cum Liaison Officer",
+      "max_marks": 3,
+      "formula_type": "QUAL",
+      "criteria_text": "",
+      "search_keywords": [
+        "Team Leader",
+        "Liaison Officer"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": true,
+      "parent_parameter": "Qualifications and Competence of Staff Members"
+    },
+    {
+      "item_code": "4b",
+      "parameter": "Procurement Expert",
+      "max_marks": 2,
+      "formula_type": "QUAL",
+      "criteria_text": "",
+      "search_keywords": [
+        "Procurement Expert",
+        "RFP Design"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": true,
+      "parent_parameter": "Qualifications and Competence of Staff Members"
+    },
+    {
+      "item_code": "4c",
+      "parameter": "Documentation Expert",
+      "max_marks": 2,
+      "formula_type": "QUAL",
+      "criteria_text": "",
+      "search_keywords": [
+        "Documentation Expert",
+        "Tender"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": true,
+      "parent_parameter": "Qualifications and Competence of Staff Members"
+    },
+    {
+      "item_code": "4d",
+      "parameter": "Urban Planning Expert",
+      "max_marks": 2,
+      "formula_type": "QUAL",
+      "criteria_text": "For Minimum 2 projects: 50% of the marks, For every additional project: 25% extra marks",
+      "search_keywords": [
+        "Urban Planning Expert",
+        "Projects"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": true,
+      "parent_parameter": "Qualifications and Competence of Staff Members"
+    },
+    {
+      "item_code": "4e",
+      "parameter": "Environmental Expert",
+      "max_marks": 2,
+      "formula_type": "QUAL",
+      "criteria_text": "",
+      "search_keywords": [
+        "Environmental Expert"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": true,
+      "parent_parameter": "Qualifications and Competence of Staff Members"
+    },
+    {
+      "item_code": "4f",
+      "parameter": "Animal Care Expert",
+      "max_marks": 2,
+      "formula_type": "QUAL",
+      "criteria_text": "",
+      "search_keywords": [
+        "Animal Care Expert"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": true,
+      "parent_parameter": "Qualifications and Competence of Staff Members"
+    },
+    {
+      "item_code": "4g",
+      "parameter": "ICT/IT Application and Monitoring Expert",
+      "max_marks": 2,
+      "formula_type": "QUAL",
+      "criteria_text": "",
+      "search_keywords": [
+        "ICT/IT Expert",
+        "Monitoring"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": true,
+      "parent_parameter": "Qualifications and Competence of Staff Members"
+    },
+    {
+      "item_code": "4h",
+      "parameter": "GIS Expert",
+      "max_marks": 2,
+      "formula_type": "QUAL",
+      "criteria_text": "",
+      "search_keywords": [
+        "GIS Expert"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": true,
+      "parent_parameter": "Qualifications and Competence of Staff Members"
+    },
+    {
+      "item_code": "4i",
+      "parameter": "Data Analyst and Reporting Manager",
+      "max_marks": 1,
+      "formula_type": "QUAL",
+      "criteria_text": "",
+      "search_keywords": [
+        "Data Analyst",
+        "Reporting Manager"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": true,
+      "parent_parameter": "Qualifications and Competence of Staff Members"
+    },
+    {
+      "item_code": "4j",
+      "parameter": "Legal Policy and Planning Expert",
+      "max_marks": 2,
+      "formula_type": "QUAL",
+      "criteria_text": "",
+      "search_keywords": [
+        "Legal Policy Expert",
+        "Planning"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": true,
+      "parent_parameter": "Qualifications and Competence of Staff Members"
+    },
+    {
+      "item_code": "4k",
+      "parameter": "Urban Finance and Taxation Expert",
+      "max_marks": 2,
+      "formula_type": "QUAL",
+      "criteria_text": "",
+      "search_keywords": [
+        "Urban Finance Expert",
+        "Taxation"
+      ],
+      "sub_criteria": [],
+      "is_parent": false,
+      "is_sub_item": true,
+      "parent_parameter": "Qualifications and Competence of Staff Members"
+    }
+  ],
+  "bands": {
+    "Turnover": {
+      "formula_type": "BAND",
+      "bands": [
+        {
+          "min": 0,
+          "max": 100,
+          "score": 5
+        },
+        {
+          "min": 100,
+          "max": 110,
+          "score": 5.5
+        },
+        {
+          "min": 110,
+          "max": 120,
+          "score": 6
+        },
+        {
+          "min": 120,
+          "max": 130,
+          "score": 6.5
+        },
+        {
+          "min": 130,
+          "max": 140,
+          "score": 7
+        },
+        {
+          "min": 140,
+          "max": 150,
+          "score": 7.5
+        },
+        {
+          "min": 150,
+          "max": 160,
+          "score": 8
+        },
+        {
+          "min": 160,
+          "max": 170,
+          "score": 8.5
+        },
+        {
+          "min": 170,
+          "max": 180,
+          "score": 9
+        },
+        {
+          "min": 180,
+          "max": 190,
+          "score": 9.5
+        },
+        {
+          "min": 190,
+          "max": 200,
+          "score": 10
+        },
+        {
+          "min": 200,
+          "max": 210,
+          "score": 10.5
+        },
+        {
+          "min": 210,
+          "max": 220,
+          "score": 11
+        },
+        {
+          "min": 220,
+          "max": 230,
+          "score": 11.5
+        },
+        {
+          "min": 230,
+          "max": 240,
+          "score": 12
+        },
+        {
+          "min": 240,
+          "max": 250,
+          "score": 12.5
+        },
+        {
+          "min": 250,
+          "max": 260,
+          "score": 13
+        },
+        {
+          "min": 260,
+          "max": 270,
+          "score": 13.5
+        },
+        {
+          "min": 270,
+          "max": 280,
+          "score": 14
+        },
+        {
+          "min": 280,
+          "max": 290,
+          "score": 14.5
+        },
+        {
+          "min": 290,
+          "max": 300,
+          "score": 15
+        },
+        {
+          "min": 300,
+          "max": null,
+          "score": 15.5
+        }
+      ],
+      "present_score": null,
+      "absent_score": 0,
+      "notes": "Turnover scoring bands"
+    },
+    "Past Experience A": {
+      "formula_type": "BAND",
+      "bands": [
+        {
+          "min": 6,
+          "max": 12,
+          "score": 15
+        },
+        {
+          "min": 12,
+          "max": null,
+          "score": 20
+        },
+        {
+          "min": 0,
+          "max": 6,
+          "score": 10
+        }
+      ],
+      "present_score": null,
+      "absent_score": 0,
+      "notes": "Single order of professionals"
+    },
+    "Past Experience B": {
+      "formula_type": "BAND",
+      "bands": [
+        {
+          "min": 1,
+          "max": null,
+          "score": 5
+        }
+      ],
+      "present_score": null,
+      "absent_score": 0,
+      "notes": "only one band exists, with a maximum of 20 marks but no clear upper bound for the band, assuming 1 project meets the criteria for 5 marks"
+    },
+    "Urban Planning Expert": {
+      "formula_type": "BAND",
+      "bands": [
+        {
+          "min": 2,
+          "max": 3,
+          "score": 50
+        },
+        {
+          "min": 3,
+          "max": null,
+          "score": 75
+        }
+      ],
+      "present_score": null,
+      "absent_score": 0,
+      "notes": "For every additional project beyond 2, 25% extra marks are added. Assuming the base 50% is for 2 projects, and every additional project adds 25%."
+    }
+  },
+  "context_source": "p41-p48"
+}

@@ -1450,12 +1450,11 @@ def tq_score_item_to_dict(item) -> dict:
     except: strengths = []
     try:    gaps = json.loads(item.gaps_json or "[]")
     except: gaps = []
+    try:    annexure_pages = json.loads(getattr(item, "annexure_pages_json", None) or "[]")
+    except: annexure_pages = []
  
     raw_score = item.score
  
-    # Sentinel values stored in DB:
-    #   "-1"  → pending (live assessment required)
-    #   "-2"  → not_scoreable (financial / comparative)
     is_pending     = raw_score in ("-1", -1) or getattr(item, "requires_live_assessment", False)
     is_comparative = raw_score in ("-2", -2) or getattr(item, "requires_comparative_evaluation", False)
  
@@ -1463,7 +1462,6 @@ def tq_score_item_to_dict(item) -> dict:
     pct_val   = None if (is_pending or is_comparative) else float(item.score_percentage or 0)
  
     layer = getattr(item, "evaluation_layer", None) or "technical_document"
-    # Back-compat: infer layer from sentinel if column missing
     if layer == "technical_document":
         if is_comparative:
             layer = "financial"
@@ -1488,7 +1486,10 @@ def tq_score_item_to_dict(item) -> dict:
         "evaluation_layer":                layer,
         "requires_live_assessment":        is_pending,
         "requires_comparative_evaluation": is_comparative,
+        # v4: annexure page references from proposal compliance table
+        "annexure_pages":                  annexure_pages,
     }
+ 
  
  
 # ─────────────────────────────────────────────────────────────────────────────

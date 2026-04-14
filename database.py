@@ -15,14 +15,12 @@ Tables:
   tq_evaluations    — SSC2: one TQ evaluation per RFP + proposal upload
   tq_score_items    — SSC2: one scored criterion per evaluation
 
-FIX NOTES (v3)
---------------
-- pool_pre_ping=True  : tests every connection before handing it out.
-- pool_recycle=1800   : force-retires connections after 30 min.
-- TQEvaluation now includes scoreable_total, live_assessment_marks,
-  financial_methodology_json, schema_valid, schema_warning columns.
-- TQScoreItem now includes requires_live_assessment column.
-- _safe_alter_columns() adds all of the above if they don't exist.
+FIX NOTES (v4 — v20 extractor)
+---------
+- annexure_pages_json added to tq_score_items: stores page references from
+  the proposal's compliance table response text (e.g. [87, 95, 452]).
+  Used by future improvements for document verification and auditing.
+- All previous v3 columns retained unchanged.
 """
 
 import os
@@ -247,16 +245,22 @@ class TQEvaluation(Base):
     total_scored       = Column(String(20), default="0")
     total_percentage   = Column(String(20), default="0")
 
-    # Denominator breakdown (added v3)
-    scoreable_total          = Column(Integer, default=0)   # marks that can be scored from document
-    live_assessment_marks    = Column(Integer, default=0)   # marks requiring live presentation/interview
+    # Denominator breakdown (v3)
+    scoreable_total          = Column(Integer, default=0)
+    live_assessment_marks    = Column(Integer, default=0)
 
-    # Schema quality signal (added v3)
+    # Schema quality signal (v3)
     schema_valid             = Column(Boolean, default=False)
     schema_warning           = Column(Text, nullable=True)
 
-    # Financial methodology extracted from RFP (added v3)
+    # Financial methodology (v3)
     financial_methodology_json = Column(Text, nullable=True)
+
+    # Qualification gate result (v3)
+    qualification_json       = Column(Text, nullable=True)
+
+    # Financial marks count (v3)
+    financial_marks          = Column(Integer, default=0)
 
     status             = Column(String(30), default="queued")
     progress           = Column(Integer, default=0)
@@ -285,7 +289,7 @@ class TQScoreItem(Base):
     parameter                = Column(String(300))
     max_marks                = Column(Integer, default=0)
     score                    = Column(String(20), default="0")     # "-1" means pending
-    score_percentage         = Column(String(20), default="0")     # "-1" means pending
+    score_percentage         = Column(String(20), default="0")
     justification            = Column(Text)
     strengths_json           = Column(Text, default="[]")
     gaps_json                = Column(Text, default="[]")
@@ -294,7 +298,11 @@ class TQScoreItem(Base):
     parent_parameter         = Column(String(300), default="")
     criteria_text            = Column(Text)
     sort_order               = Column(Integer, default=0)
-    requires_live_assessment = Column(Boolean, default=False)      # added v3
+    requires_live_assessment = Column(Boolean, default=False)
+
+    # v4: annexure page references extracted from proposal compliance table
+    # JSON array of integers: [87, 95, 303, 345, 452]
+    annexure_pages_json      = Column(Text, default="[]")
 
     evaluation = relationship("TQEvaluation", back_populates="scores")
 
@@ -344,12 +352,15 @@ def _safe_alter_columns():
         # SSC2 / TQ evaluations — v1 columns
         "ALTER TABLE tq_evaluations ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP",
 
-        # SSC2 / TQ evaluations — v3 columns (denominator + schema quality)
+        # SSC2 / TQ evaluations — v3 columns
         "ALTER TABLE tq_evaluations ADD COLUMN IF NOT EXISTS scoreable_total INTEGER DEFAULT 0",
         "ALTER TABLE tq_evaluations ADD COLUMN IF NOT EXISTS live_assessment_marks INTEGER DEFAULT 0",
         "ALTER TABLE tq_evaluations ADD COLUMN IF NOT EXISTS schema_valid BOOLEAN DEFAULT FALSE",
         "ALTER TABLE tq_evaluations ADD COLUMN IF NOT EXISTS schema_warning TEXT",
         "ALTER TABLE tq_evaluations ADD COLUMN IF NOT EXISTS financial_methodology_json TEXT",
+        "ALTER TABLE tq_evaluations ADD COLUMN IF NOT EXISTS qualification_json TEXT",
+        "ALTER TABLE tq_evaluations ADD COLUMN IF NOT EXISTS financial_marks INTEGER DEFAULT 0",
+        "ALTER TABLE tq_evaluations ADD COLUMN IF NOT EXISTS final_score_formula TEXT",
 
         # SSC2 / TQ score items — v1 columns
         "ALTER TABLE tq_score_items ADD COLUMN IF NOT EXISTS criteria_text TEXT",
@@ -357,6 +368,13 @@ def _safe_alter_columns():
 
         # SSC2 / TQ score items — v3 columns
         "ALTER TABLE tq_score_items ADD COLUMN IF NOT EXISTS requires_live_assessment BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE tq_score_items ADD COLUMN IF NOT EXISTS evaluation_layer VARCHAR(50) DEFAULT 'technical_document'",
+        "ALTER TABLE tq_score_items ADD COLUMN IF NOT EXISTS requires_comparative_evaluation BOOLEAN DEFAULT FALSE",
+
+        # SSC2 / TQ score items — v4 columns (v20 extractor)
+        # Stores JSON array of page numbers from proposal compliance table
+        # e.g. [87, 95, 303, 345, 452, 474] — annexures for this criterion
+        "ALTER TABLE tq_score_items ADD COLUMN IF NOT EXISTS annexure_pages_json TEXT DEFAULT '[]'",
     ]
     try:
         with engine.connect() as conn:
@@ -364,7 +382,7 @@ def _safe_alter_columns():
                 try:
                     conn.execute(text(stmt))
                 except Exception:
-                    pass    # column may already exist — that's fine
+                    pass
             conn.commit()
     except Exception as e:
         print(f"[DB] _safe_alter_columns warning: {e}")
