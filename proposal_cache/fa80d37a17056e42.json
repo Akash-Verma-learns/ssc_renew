@@ -1,0 +1,89 @@
+{
+  "values": {
+    "Turnover": {
+      "found": true,
+      "value": "884.48 Cr",
+      "page": 13
+    },
+    "Past Experience A": {
+      "found": true,
+      "value": "26",
+      "page": 13
+    },
+    "Past Experience B": {
+      "found": true,
+      "value": "20 marks",
+      "page": 3
+    }
+  },
+  "cv_results": {
+    "Team Leader cum Liaison Officer": {
+      "present": true,
+      "confidence": "high",
+      "evidence_page": 346,
+      "evidence_snippet": "M5 \nM6 \nM7 \nM8 \nM9 \nM10 \nM11 \nM12 \nM13 \nM14 \nM15 \nM16 \nM17 \nM18 \nM19 \nM20 \nM21 \nM22 \nM23 \nM24 \n1 \nTeam Lead cum Liaison \nOfficer \nWill be deployed on a full-time basis for 24 Months \n2 \nProcurement Ex"
+    },
+    "Procurement Expert": {
+      "present": true,
+      "confidence": "high",
+      "evidence_page": 346,
+      "evidence_snippet": "23 \nM24 \n1 \nTeam Lead cum Liaison \nOfficer \nWill be deployed on a full-time basis for 24 Months \n2 \nProcurement Expert \nWill be deployed on a full-time basis for 24 Months \n3 \nDocumentation Expert  \nW"
+    },
+    "Documentation Expert": {
+      "present": true,
+      "confidence": "high",
+      "evidence_page": 346,
+      "evidence_snippet": "basis for 24 Months \n2 \nProcurement Expert \nWill be deployed on a full-time basis for 24 Months \n3 \nDocumentation Expert  \nWill be deployed on a full-time basis for 24 Months \n4 \nUrban Planning Expert"
+    },
+    "Urban Planning Expert": {
+      "present": true,
+      "confidence": "high",
+      "evidence_page": 346,
+      "evidence_snippet": "is for 24 Months \n3 \nDocumentation Expert  \nWill be deployed on a full-time basis for 24 Months \n4 \nUrban Planning Expert 1 \nWill be deployed on a full-time basis for 24 Months \n5 \nUrban Planning Expe"
+    },
+    "Environmental Expert": {
+      "present": true,
+      "confidence": "high",
+      "evidence_page": 346,
+      "evidence_snippet": "for 24 Months \n5 \nUrban Planning Expert 2 \nWill be deployed on a full-time basis for 24 Months \n6 \nEnvironmental Expert \nWill be deployed on a full-time basis for 24 Months \n7 \nAnimal Care Expert \nWil"
+    },
+    "Animal Care Expert": {
+      "present": true,
+      "confidence": "high",
+      "evidence_page": 346,
+      "evidence_snippet": "24 Months \n6 \nEnvironmental Expert \nWill be deployed on a full-time basis for 24 Months \n7 \nAnimal Care Expert \nWill be deployed on a full-time basis for 24 Months \n8 \nICT/ IT Application and \nMonitor"
+    },
+    "ICT/IT Application and Monitoring Expert": {
+      "present": true,
+      "confidence": "high",
+      "evidence_page": 346,
+      "evidence_snippet": "basis for 24 Months \n7 \nAnimal Care Expert \nWill be deployed on a full-time basis for 24 Months \n8 \nICT/ IT Application and \nMonitoring Expert  \nWill be deployed on a full-time basis for 24 Months \n9 "
+    },
+    "GIS Expert": {
+      "present": true,
+      "confidence": "high",
+      "evidence_page": 346,
+      "evidence_snippet": "CT/ IT Application and \nMonitoring Expert  \nWill be deployed on a full-time basis for 24 Months \n9 \nGIS Expert \nWill be deployed on a full-time basis for 24 Months \n10 \nData Analyst and Reporting \nMan"
+    },
+    "Data Analyst and Reporting Manager": {
+      "present": true,
+      "confidence": "high",
+      "evidence_page": 346,
+      "evidence_snippet": "e basis for 24 Months \n9 \nGIS Expert \nWill be deployed on a full-time basis for 24 Months \n10 \nData Analyst and Reporting \nManager 1 \nWill be deployed on a full-time basis for 24 Months \n11 \nData Anal"
+    },
+    "Legal Policy and Planning Expert": {
+      "present": true,
+      "confidence": "high",
+      "evidence_page": 346,
+      "evidence_snippet": "ta Analyst and Reporting \nManager 2 \nWill be deployed on a full-time basis for 24 Months \n12 \nLegal Policy and Planning \nExpert \nWill be deployed on a full-time basis for 24 Months \n13 \nUrban Finance "
+    },
+    "Urban Finance and Taxation Expert": {
+      "present": true,
+      "confidence": "high",
+      "evidence_page": 346,
+      "evidence_snippet": "y and Planning \nExpert \nWill be deployed on a full-time basis for 24 Months \n13 \nUrban Finance and \nTaxation \nWill be deployed on a full-time basis for 24 Months"
+    }
+  },
+  "criteria_hash": "98760455",
+  "cached_at": "2026-04-14T20:09:40"
+}

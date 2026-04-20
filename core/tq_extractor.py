@@ -802,7 +802,16 @@ def run_tq_evaluation(
     _prog(f"Found {len(scoreable)} scoreable criteria ({doc_max} marks){live_msg}{cache_msg}", 15)
     _prog("Ingesting proposal into vector store", 20)
     ingest_proposal(proposal_path, proposal_doc_name)
+
+    # ── Warm proposal analysis cache (1 bulk LLM call total) ──────────────
+    _prog("Analyzing proposal (bulk extraction)", 23)
+    try:
+        from core.tq_scorer import warm_analysis_cache
+        warm_analysis_cache(proposal_path, scoreable)
+    except Exception as e:
+        print(f"[TQ] Analysis warm error (non-fatal): {e}")
     _prog("Scoring criteria against proposal", 28)
+    # ──────────────────────────────────────────────────────────────────────
 
     # Import scorer — pass rfp_bands so it can use them without extra LLM calls
     try:

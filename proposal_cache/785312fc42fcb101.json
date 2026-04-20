@@ -1,0 +1,60 @@
+{
+  "values": {
+    "Experience as PMA/PMU (PER_UNIT, max 15 marks): 5 marks per assignment": {
+      "found": true,
+      "value": "3 assignments",
+      "page": 7
+    },
+    "Experience in designing/implementing agribusiness programs (PER_UNIT, max 30 marks): 5 marks per eligible assignment": {
+      "found": true,
+      "value": "4 assignments",
+      "page": 7
+    },
+    "Additional Experience in Horticulture Sector (BINARY, max 5 marks): Additional 5 marks shall be awarded if minimum 3 out of 6 eligible assignments are in the horticulture sector": {
+      "found": true,
+      "value": "Yes",
+      "page": 77
+    },
+    "Revenue from Rs 1-5 Crores (BINARY, max 5 marks): From Rs 1-5 Crores - 5 Marks": {
+      "found": false,
+      "value": null,
+      "page": null
+    },
+    "Revenue from Rs 5.1-10 Crores (BINARY, max 10 marks): Rs 5.1-10 Crores - 10 Marks": {
+      "found": false,
+      "value": null,
+      "page": null
+    },
+    "Revenue above Rs 10 Crores (BINARY, max 15 marks): More than Rs 10 Crores - 15 Marks": {
+      "found": true,
+      "value": "Yes",
+      "page": 9
+    },
+    "Average Revenue (BAND, max 10 marks): >Rs 50 to 100 Crore - 1 Mark, >Rs 100 to 150 Crore - 2 Marks, >Rs 150 to 200 Crore - 3 Marks, >Rs 200 Crores - 5 Marks": {
+      "found": true,
+      "value": "INR 12.30 Cr",
+      "page": 9
+    },
+    "Additional 10 marks (BINARY, max 10 marks): Additional 5 marks shall be awarded if minimum 3 out of 6 eligible assignments as per above qualifications are in the horticulture sector. (5 marks)": {
+      "found": true,
+      "value": "Yes",
+      "page": 77
+    }
+  },
+  "cv_results": {
+    "Team Leader": {
+      "present": true,
+      "confidence": "high",
+      "evidence_page": 72,
+      "evidence_snippet": "B. National Consultants \n \n \n \n \n \n11. \nHorticulture agribusiness and marketing specialist/deputy team leader (national, 4.0 \nperson-months) \n(i) \nDetailed tasks and/or expected output \nThe consultant"
+    },
+    "Core Team Experts": {
+      "present": true,
+      "confidence": "high",
+      "evidence_page": 245,
+      "evidence_snippet": "teams of SP by\n2 months\nthe StateSPteam\n--\nTask-3: Developtemplates and checklists for\n3 months\nS%\ncore processes and outputs\nTask 4: Baseline Survey,Enterprise mapping,\n6 months\nS%\n&AwarenessCampaign"
+    }
+  },
+  "criteria_hash": "3d2ecae7",
+  "cached_at": "2026-04-14T23:51:16"
+}
