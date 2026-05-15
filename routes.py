@@ -274,263 +274,263 @@ KEY CHANGES vs the original
 
 from pathlib import Path
 
+from core.document_parser import parse_document_simple as parse_document
+# def run_pipeline_task(rfp_id: int, file_path: str, job_id: str):
+#     from database import SessionLocal, RFP, ClauseResult, LearnedRule
 
-def run_pipeline_task(rfp_id: int, file_path: str, job_id: str):
-    from database import SessionLocal, RFP, ClauseResult, LearnedRule
+#     # ── helpers ────────────────────────────────────────────────────────────────
 
-    # ── helpers ────────────────────────────────────────────────────────────────
+#     def _fresh_db():
+#         """Return a brand-new session.  Caller must close() in a finally block."""
+#         return SessionLocal()
 
-    def _fresh_db():
-        """Return a brand-new session.  Caller must close() in a finally block."""
-        return SessionLocal()
+#     def _safe_commit(db, label=""):
+#         try:
+#             db.commit()
+#         except Exception as e:
+#             print(f"[Pipeline] commit failed ({label}): {e}")
+#             try:
+#                 db.rollback()
+#             except Exception:
+#                 pass
 
-    def _safe_commit(db, label=""):
-        try:
-            db.commit()
-        except Exception as e:
-            print(f"[Pipeline] commit failed ({label}): {e}")
-            try:
-                db.rollback()
-            except Exception:
-                pass
+#     # ── open main session ──────────────────────────────────────────────────────
+#     db = _fresh_db()
 
-    # ── open main session ──────────────────────────────────────────────────────
-    db = _fresh_db()
+#     try:
+#         rfp = db.query(RFP).filter(RFP.id == rfp_id).first()
+#         if not rfp:
+#             print(f"[Pipeline] RFP {rfp_id} not found — aborting.")
+#             return
 
-    try:
-        rfp = db.query(RFP).filter(RFP.id == rfp_id).first()
-        if not rfp:
-            print(f"[Pipeline] RFP {rfp_id} not found — aborting.")
-            return
+#         # ── status helper (uses main session) ─────────────────────────────────
+#         def update(status, progress, step):
+#             try:
+#                 rfp.status       = status
+#                 rfp.progress     = progress
+#                 rfp.current_step = step
+#                 db.commit()
+#             except Exception as e:
+#                 print(f"[Pipeline] status update failed: {e}")
+#                 try:
+#                     db.rollback()
+#                 except Exception:
+#                     pass
 
-        # ── status helper (uses main session) ─────────────────────────────────
-        def update(status, progress, step):
-            try:
-                rfp.status       = status
-                rfp.progress     = progress
-                rfp.current_step = step
-                db.commit()
-            except Exception as e:
-                print(f"[Pipeline] status update failed: {e}")
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
+#         update("processing", 10, "Parsing document")
 
-        update("processing", 10, "Parsing document")
+#         from routes import _parse_offering_solutions   # local import — avoids circular
+#         offerings, solutions = _parse_offering_solutions(rfp.offering or "", rfp.solutions or "")
+#         primary_offering = offerings[0] if offerings else ""
+#         primary_solution = solutions[0] if solutions else ""
 
-        from routes import _parse_offering_solutions   # local import — avoids circular
-        offerings, solutions = _parse_offering_solutions(rfp.offering or "", rfp.solutions or "")
-        primary_offering = offerings[0] if offerings else ""
-        primary_solution = solutions[0] if solutions else ""
+#         from core.parser       import parse_document
+#         from core.vector_store import ingest_chunks
+#         from core.extractor    import extract_all_clauses
+#         from rules.risk_engine import evaluate_clause, RiskResult
 
-        from core.parser       import parse_document
-        from core.vector_store import ingest_chunks
-        from core.extractor    import extract_all_clauses
-        from rules.risk_engine import evaluate_clause, RiskResult
+#         doc_name = Path(file_path).name
+#         chunks   = parse_document(file_path)
+#         print(f"[Pipeline] {len(chunks)} chunks extracted")
 
-        doc_name = Path(file_path).name
-        chunks   = parse_document(file_path)
-        print(f"[Pipeline] {len(chunks)} chunks extracted")
+#         update("processing", 35, "Ingesting into vector store")
+#         ingest_chunks(chunks, doc_id=doc_name)
 
-        update("processing", 35, "Ingesting into vector store")
-        ingest_chunks(chunks, doc_id=doc_name)
+#         # ── Metadata extraction ────────────────────────────────────────────────
+#         # Uses its own requests call (no DB held open).
+#         update("processing", 45, "Extracting document metadata")
+#         try:
+#             from core.metadata_extractor import extract_metadata
+#             meta     = extract_metadata(doc_name)
+#             opp_name = meta.get("opportunity_name")
+#             cli_name = meta.get("client_name")
 
-        # ── Metadata extraction ────────────────────────────────────────────────
-        # Uses its own requests call (no DB held open).
-        update("processing", 45, "Extracting document metadata")
-        try:
-            from core.metadata_extractor import extract_metadata
-            meta     = extract_metadata(doc_name)
-            opp_name = meta.get("opportunity_name")
-            cli_name = meta.get("client_name")
+#             if opp_name and len(opp_name.strip()) > 5:
+#                 rfp.opportunity_name = opp_name.strip()
+#                 print(f"[Pipeline] opportunity_name set: {rfp.opportunity_name!r}")
+#             else:
+#                 print(f"[Pipeline] opportunity_name not extracted (got: {opp_name!r})")
 
-            if opp_name and len(opp_name.strip()) > 5:
-                rfp.opportunity_name = opp_name.strip()
-                print(f"[Pipeline] opportunity_name set: {rfp.opportunity_name!r}")
-            else:
-                print(f"[Pipeline] opportunity_name not extracted (got: {opp_name!r})")
+#             if cli_name and len(cli_name.strip()) > 2:
+#                 rfp.client_name = cli_name.strip()
+#                 print(f"[Pipeline] client_name set: {rfp.client_name!r}")
+#             else:
+#                 print(f"[Pipeline] client_name not extracted (got: {cli_name!r})")
 
-            if cli_name and len(cli_name.strip()) > 2:
-                rfp.client_name = cli_name.strip()
-                print(f"[Pipeline] client_name set: {rfp.client_name!r}")
-            else:
-                print(f"[Pipeline] client_name not extracted (got: {cli_name!r})")
+#             _safe_commit(db, "metadata")
+#         except Exception as meta_exc:
+#             print(f"[Pipeline] Metadata extraction skipped: {meta_exc}")
+#             try:
+#                 db.rollback()
+#             except Exception:
+#                 pass
 
-            _safe_commit(db, "metadata")
-        except Exception as meta_exc:
-            print(f"[Pipeline] Metadata extraction skipped: {meta_exc}")
-            try:
-                db.rollback()
-            except Exception:
-                pass
+#         # ── Clause extraction ──────────────────────────────────────────────────
+#         # IMPORTANT: do NOT pass `db` here.
+#         # extract_all_clauses v2 opens its own fresh session per clause lookup,
+#         # so no DB connection is ever held open during an Ollama call.
+#         update("processing", 50, "Extracting clauses (with learning context)")
 
-        # ── Clause extraction ──────────────────────────────────────────────────
-        # IMPORTANT: do NOT pass `db` here.
-        # extract_all_clauses v2 opens its own fresh session per clause lookup,
-        # so no DB connection is ever held open during an Ollama call.
-        update("processing", 50, "Extracting clauses (with learning context)")
+#         extraction_results = {}
+#         try:
+#             extraction_results = extract_all_clauses(
+#                 doc_name=doc_name,
+#                 model="llama3.2",
+#                 offering=primary_offering,
+#                 solution=primary_solution,
+#                 # db intentionally omitted — extractor manages its own sessions
+#             )
+#         except Exception as ext_exc:
+#             print(f"[Pipeline] Clause extraction error: {ext_exc}")
+#             # Continue — we'll save whatever partial results we have
 
-        extraction_results = {}
-        try:
-            extraction_results = extract_all_clauses(
-                doc_name=doc_name,
-                model="llama3.2",
-                offering=primary_offering,
-                solution=primary_solution,
-                # db intentionally omitted — extractor manages its own sessions
-            )
-        except Exception as ext_exc:
-            print(f"[Pipeline] Clause extraction error: {ext_exc}")
-            # Continue — we'll save whatever partial results we have
+#         # ── Learned-rule lookup ────────────────────────────────────────────────
+#         # Fresh session per clause type — closed immediately after the query.
+#         update("processing", 70, "Evaluating risk + checking learned rules")
 
-        # ── Learned-rule lookup ────────────────────────────────────────────────
-        # Fresh session per clause type — closed immediately after the query.
-        update("processing", 70, "Evaluating risk + checking learned rules")
+#         CLAUSE_ORDER = [
+#             "liability", "insurance", "scope", "payment", "deliverables",
+#             "personnel", "ld", "penalties", "termination", "eligibility",
+#         ]
 
-        CLAUSE_ORDER = [
-            "liability", "insurance", "scope", "payment", "deliverables",
-            "personnel", "ld", "penalties", "termination", "eligibility",
-        ]
+#         from rules.learning_store import get_learned_rule
+#         learned_rule_ids: dict = {}
+#         for ct in CLAUSE_ORDER:
+#             _db2 = _fresh_db()
+#             try:
+#                 rule_text = get_learned_rule(ct, primary_offering, primary_solution, _db2)
+#                 if rule_text:
+#                     rule_row = _db2.query(LearnedRule).filter(
+#                         LearnedRule.clause_type == ct,
+#                         LearnedRule.is_active   == True,
+#                     ).first()
+#                     if rule_row:
+#                         learned_rule_ids[ct] = rule_row.id
+#                         print(f"[Pipeline] Learned rule active: {ct} / {primary_offering}")
+#             except Exception as lr_err:
+#                 print(f"[Pipeline] Learned rule lookup failed ({ct}): {lr_err}")
+#             finally:
+#                 try:
+#                     _db2.close()
+#                 except Exception:
+#                     pass
 
-        from rules.learning_store import get_learned_rule
-        learned_rule_ids: dict = {}
-        for ct in CLAUSE_ORDER:
-            _db2 = _fresh_db()
-            try:
-                rule_text = get_learned_rule(ct, primary_offering, primary_solution, _db2)
-                if rule_text:
-                    rule_row = _db2.query(LearnedRule).filter(
-                        LearnedRule.clause_type == ct,
-                        LearnedRule.is_active   == True,
-                    ).first()
-                    if rule_row:
-                        learned_rule_ids[ct] = rule_row.id
-                        print(f"[Pipeline] Learned rule active: {ct} / {primary_offering}")
-            except Exception as lr_err:
-                print(f"[Pipeline] Learned rule lookup failed ({ct}): {lr_err}")
-            finally:
-                try:
-                    _db2.close()
-                except Exception:
-                    pass
+#         # ── Risk evaluation + feedback adjustment ──────────────────────────────
+#         update("processing", 82, "Saving results")
 
-        # ── Risk evaluation + feedback adjustment ──────────────────────────────
-        update("processing", 82, "Saving results")
+#         for ct in CLAUSE_ORDER:
+#             ext  = extraction_results.get(ct, {})
+#             exd  = ext.get("extracted", {})
 
-        for ct in CLAUSE_ORDER:
-            ext  = extraction_results.get(ct, {})
-            exd  = ext.get("extracted", {})
+#             try:
+#                 risk = evaluate_clause(ct, exd)
+#             except Exception as re_err:
+#                 risk = RiskResult(
+#                     clause_name=ct,
+#                     risk_level="NEEDS_REVIEW",
+#                     risk_description=f"Evaluation failed: {re_err}",
+#                     auto_remark="",
+#                 )
 
-            try:
-                risk = evaluate_clause(ct, exd)
-            except Exception as re_err:
-                risk = RiskResult(
-                    clause_name=ct,
-                    risk_level="NEEDS_REVIEW",
-                    risk_description=f"Evaluation failed: {re_err}",
-                    auto_remark="",
-                )
+#             # Feedback adjustment — fresh session, closed immediately
+#             adj_level = adj_reason = adj_conf = None
+#             adj_count = 0
+#             _db3 = _fresh_db()
+#             try:
+#                 from rules.feedback_engine import get_adjustment
+#                 adj = get_adjustment(ct, primary_offering, primary_solution, risk.risk_level, _db3)
+#                 adj_level  = adj["adjusted_risk_level"] if adj["applied"] else None
+#                 adj_reason = adj["reason"]              if adj["applied"] else None
+#                 adj_conf   = str(adj["confidence"])     if adj["applied"] else None
+#                 adj_count  = adj["feedback_count"]
+#             except Exception as adj_err:
+#                 print(f"[Pipeline] Adjustment lookup failed ({ct}): {adj_err}")
+#             finally:
+#                 try:
+#                     _db3.close()
+#                 except Exception:
+#                     pass
 
-            # Feedback adjustment — fresh session, closed immediately
-            adj_level = adj_reason = adj_conf = None
-            adj_count = 0
-            _db3 = _fresh_db()
-            try:
-                from rules.feedback_engine import get_adjustment
-                adj = get_adjustment(ct, primary_offering, primary_solution, risk.risk_level, _db3)
-                adj_level  = adj["adjusted_risk_level"] if adj["applied"] else None
-                adj_reason = adj["reason"]              if adj["applied"] else None
-                adj_conf   = str(adj["confidence"])     if adj["applied"] else None
-                adj_count  = adj["feedback_count"]
-            except Exception as adj_err:
-                print(f"[Pipeline] Adjustment lookup failed ({ct}): {adj_err}")
-            finally:
-                try:
-                    _db3.close()
-                except Exception:
-                    pass
+#             cr = ClauseResult(
+#                 rfp_id=rfp_id,
+#                 clause_type=ct,
+#                 clause_text=exd.get("clause_text") or exd.get("summary", ""),
+#                 clause_reference=exd.get("clause_reference", ""),
+#                 page_no=str(exd.get("page_no", "") or ""),
+#                 risk_level=risk.risk_level,
+#                 risk_description=risk.risk_description,
+#                 auto_remark=exd.get("auto_remark", ""),
+#                 needs_exception=bool(exd.get("needs_exception_approval", False)),
+#                 needs_eqcr=bool(exd.get("needs_eqcr", False)),
+#                 deviation_suggested=exd.get("deviation_suggested", "") or "",
+#                 adjusted_risk_level=adj_level,
+#                 adjustment_reason=adj_reason,
+#                 adjustment_confidence=adj_conf,
+#                 feedback_count=adj_count,
+#                 learned_rule_applied=ct in learned_rule_ids,
+#                 learned_rule_id=learned_rule_ids.get(ct),
+#             )
+#             db.add(cr)
 
-            cr = ClauseResult(
-                rfp_id=rfp_id,
-                clause_type=ct,
-                clause_text=exd.get("clause_text") or exd.get("summary", ""),
-                clause_reference=exd.get("clause_reference", ""),
-                page_no=str(exd.get("page_no", "") or ""),
-                risk_level=risk.risk_level,
-                risk_description=risk.risk_description,
-                auto_remark=exd.get("auto_remark", ""),
-                needs_exception=bool(exd.get("needs_exception_approval", False)),
-                needs_eqcr=bool(exd.get("needs_eqcr", False)),
-                deviation_suggested=exd.get("deviation_suggested", "") or "",
-                adjusted_risk_level=adj_level,
-                adjustment_reason=adj_reason,
-                adjustment_confidence=adj_conf,
-                feedback_count=adj_count,
-                learned_rule_applied=ct in learned_rule_ids,
-                learned_rule_id=learned_rule_ids.get(ct),
-            )
-            db.add(cr)
+#         # ── DOCX output ────────────────────────────────────────────────────────
+#         from pathlib import Path as _Path
+#         OUTPUT_DIR = _Path("./outputs")
+#         OUTPUT_DIR.mkdir(exist_ok=True)
 
-        # ── DOCX output ────────────────────────────────────────────────────────
-        from pathlib import Path as _Path
-        OUTPUT_DIR = _Path("./outputs")
-        OUTPUT_DIR.mkdir(exist_ok=True)
+#         try:
+#             from output.writer import build_table_rows, fill_ssc1_table
+#             table_rows = build_table_rows({
+#                 ct: {
+#                     "extracted": extraction_results.get(ct, {}).get("extracted", {}),
+#                     "risk": None,
+#                 }
+#                 for ct in CLAUSE_ORDER
+#             })
+#             fill_ssc1_table(
+#                 table_rows,
+#                 "document_for_format.docx",
+#                 str(OUTPUT_DIR / f"{job_id}_ssc1.docx"),
+#                 rfp_name=rfp.opportunity_name or job_id,
+#             )
+#         except Exception as docx_err:
+#             print(f"[Pipeline] DOCX output skipped: {docx_err}")
 
-        try:
-            from output.writer import build_table_rows, fill_ssc1_table
-            table_rows = build_table_rows({
-                ct: {
-                    "extracted": extraction_results.get(ct, {}).get("extracted", {}),
-                    "risk": None,
-                }
-                for ct in CLAUSE_ORDER
-            })
-            fill_ssc1_table(
-                table_rows,
-                "document_for_format.docx",
-                str(OUTPUT_DIR / f"{job_id}_ssc1.docx"),
-                rfp_name=rfp.opportunity_name or job_id,
-            )
-        except Exception as docx_err:
-            print(f"[Pipeline] DOCX output skipped: {docx_err}")
+#         # ── Final commit ───────────────────────────────────────────────────────
+#         rfp.status       = "completed"
+#         rfp.progress     = 100
+#         rfp.current_step = "Done"
+#         db.commit()
+#         print(f"[Pipeline] RFP {rfp_id} completed.")
 
-        # ── Final commit ───────────────────────────────────────────────────────
-        rfp.status       = "completed"
-        rfp.progress     = 100
-        rfp.current_step = "Done"
-        db.commit()
-        print(f"[Pipeline] RFP {rfp_id} completed.")
-
-    except Exception as e:
-        print(f"[Pipeline] RFP {rfp_id} FAILED: {e}")
-        # Try to mark failed on the main session; if that's dead, open a fresh one.
-        for _session in [db, _fresh_db()]:
-            try:
-                try:
-                    _session.rollback()
-                except Exception:
-                    pass
-                _session.query(RFP).filter(RFP.id == rfp_id).update({
-                    "status":        "failed",
-                    "error_message": str(e),
-                    "current_step":  "Failed",
-                })
-                _session.commit()
-                break   # succeeded — stop trying
-            except Exception as db_err:
-                print(f"[Pipeline] Could not write failed status: {db_err}")
-            finally:
-                if _session is not db:   # don't double-close the main session
-                    try:
-                        _session.close()
-                    except Exception:
-                        pass
-    finally:
-        try:
-            db.close()
-        except Exception:
-            pass
+#     except Exception as e:
+#         print(f"[Pipeline] RFP {rfp_id} FAILED: {e}")
+#         # Try to mark failed on the main session; if that's dead, open a fresh one.
+#         for _session in [db, _fresh_db()]:
+#             try:
+#                 try:
+#                     _session.rollback()
+#                 except Exception:
+#                     pass
+#                 _session.query(RFP).filter(RFP.id == rfp_id).update({
+#                     "status":        "failed",
+#                     "error_message": str(e),
+#                     "current_step":  "Failed",
+#                 })
+#                 _session.commit()
+#                 break   # succeeded — stop trying
+#             except Exception as db_err:
+#                 print(f"[Pipeline] Could not write failed status: {db_err}")
+#             finally:
+#                 if _session is not db:   # don't double-close the main session
+#                     try:
+#                         _session.close()
+#                     except Exception:
+#                         pass
+#     finally:
+#         try:
+#             db.close()
+#         except Exception:
+#             pass
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AUTH

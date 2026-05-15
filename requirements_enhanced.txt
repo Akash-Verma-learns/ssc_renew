@@ -1,0 +1,46 @@
+# ── Core (existing) ──────────────────────────────────────────────────────────
+chromadb==0.5.0
+pymupdf==1.24.0
+sentence-transformers==3.0.0
+ollama==0.2.1
+python-docx==1.1.2
+fastapi==0.111.0
+uvicorn==0.30.0
+python-multipart==0.0.9
+
+# ── Enhanced parsing ─────────────────────────────────────────────────────────
+
+# LlamaParse — best-in-class PDF parser (requires LLAMA_CLOUD_API_KEY)
+# pip install llama-parse llama-index-core
+llama-parse>=0.5.0
+llama-index-core>=0.10.0
+
+# Mistral OCR — vision-based document understanding (requires MISTRAL_API_KEY)
+mistralai>=1.0.0
+
+# Docling — local table-aware parser using TableFormer ML model (no API key)
+# Large install (~2GB with models). Use: pip install docling
+# docling>=2.0.0   # uncomment to install
+
+# ── Knowledge graph ──────────────────────────────────────────────────────────
+networkx>=3.0
+
+# ── LLM clients ──────────────────────────────────────────────────────────────
+# Gemini Flash (primary LLM — requires GEMINI_API_KEY)
+google-genai>=0.8.0
+
+# requests already included via fastapi, but pin explicitly
+requests>=2.31.0
+
+# ── Auth / security (existing) ───────────────────────────────────────────────
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+python-dotenv>=1.0.0
+
+# ── Database (existing) ──────────────────────────────────────────────────────
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+pandas>=2.0.0      # used by Docling DataFrames
+aiofiles>=23.0.0   # async file ops in FastAPI
