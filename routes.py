@@ -275,262 +275,262 @@ KEY CHANGES vs the original
 from pathlib import Path
 
 from core.document_parser import parse_document_simple as parse_document
-# def run_pipeline_task(rfp_id: int, file_path: str, job_id: str):
-#     from database import SessionLocal, RFP, ClauseResult, LearnedRule
+def run_pipeline_task(rfp_id: int, file_path: str, job_id: str):
+    from database import SessionLocal, RFP, ClauseResult, LearnedRule
 
-#     # ── helpers ────────────────────────────────────────────────────────────────
+    # ── helpers ────────────────────────────────────────────────────────────────
 
-#     def _fresh_db():
-#         """Return a brand-new session.  Caller must close() in a finally block."""
-#         return SessionLocal()
+    def _fresh_db():
+        """Return a brand-new session.  Caller must close() in a finally block."""
+        return SessionLocal()
 
-#     def _safe_commit(db, label=""):
-#         try:
-#             db.commit()
-#         except Exception as e:
-#             print(f"[Pipeline] commit failed ({label}): {e}")
-#             try:
-#                 db.rollback()
-#             except Exception:
-#                 pass
+    def _safe_commit(db, label=""):
+        try:
+            db.commit()
+        except Exception as e:
+            print(f"[Pipeline] commit failed ({label}): {e}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
 
-#     # ── open main session ──────────────────────────────────────────────────────
-#     db = _fresh_db()
+    # ── open main session ──────────────────────────────────────────────────────
+    db = _fresh_db()
 
-#     try:
-#         rfp = db.query(RFP).filter(RFP.id == rfp_id).first()
-#         if not rfp:
-#             print(f"[Pipeline] RFP {rfp_id} not found — aborting.")
-#             return
+    try:
+        rfp = db.query(RFP).filter(RFP.id == rfp_id).first()
+        if not rfp:
+            print(f"[Pipeline] RFP {rfp_id} not found — aborting.")
+            return
 
-#         # ── status helper (uses main session) ─────────────────────────────────
-#         def update(status, progress, step):
-#             try:
-#                 rfp.status       = status
-#                 rfp.progress     = progress
-#                 rfp.current_step = step
-#                 db.commit()
-#             except Exception as e:
-#                 print(f"[Pipeline] status update failed: {e}")
-#                 try:
-#                     db.rollback()
-#                 except Exception:
-#                     pass
+        # ── status helper (uses main session) ─────────────────────────────────
+        def update(status, progress, step):
+            try:
+                rfp.status       = status
+                rfp.progress     = progress
+                rfp.current_step = step
+                db.commit()
+            except Exception as e:
+                print(f"[Pipeline] status update failed: {e}")
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
 
-#         update("processing", 10, "Parsing document")
+        update("processing", 10, "Parsing document")
 
-#         from routes import _parse_offering_solutions   # local import — avoids circular
-#         offerings, solutions = _parse_offering_solutions(rfp.offering or "", rfp.solutions or "")
-#         primary_offering = offerings[0] if offerings else ""
-#         primary_solution = solutions[0] if solutions else ""
+        from routes import _parse_offering_solutions   # local import — avoids circular
+        offerings, solutions = _parse_offering_solutions(rfp.offering or "", rfp.solutions or "")
+        primary_offering = offerings[0] if offerings else ""
+        primary_solution = solutions[0] if solutions else ""
 
-#         from core.parser       import parse_document
-#         from core.vector_store import ingest_chunks
-#         from core.extractor    import extract_all_clauses
-#         from rules.risk_engine import evaluate_clause, RiskResult
+        from core.parser       import parse_document
+        from core.vector_store import ingest_chunks
+        from core.extractor    import extract_all_clauses
+        from rules.risk_engine import evaluate_clause, RiskResult
 
-#         doc_name = Path(file_path).name
-#         chunks   = parse_document(file_path)
-#         print(f"[Pipeline] {len(chunks)} chunks extracted")
+        doc_name = Path(file_path).name
+        chunks   = parse_document(file_path)
+        print(f"[Pipeline] {len(chunks)} chunks extracted")
 
-#         update("processing", 35, "Ingesting into vector store")
-#         ingest_chunks(chunks, doc_id=doc_name)
+        update("processing", 35, "Ingesting into vector store")
+        ingest_chunks(chunks, doc_id=doc_name)
 
-#         # ── Metadata extraction ────────────────────────────────────────────────
-#         # Uses its own requests call (no DB held open).
-#         update("processing", 45, "Extracting document metadata")
-#         try:
-#             from core.metadata_extractor import extract_metadata
-#             meta     = extract_metadata(doc_name)
-#             opp_name = meta.get("opportunity_name")
-#             cli_name = meta.get("client_name")
+        # ── Metadata extraction ────────────────────────────────────────────────
+        # Uses its own requests call (no DB held open).
+        update("processing", 45, "Extracting document metadata")
+        try:
+            from core.metadata_extractor import extract_metadata
+            meta     = extract_metadata(doc_name)
+            opp_name = meta.get("opportunity_name")
+            cli_name = meta.get("client_name")
 
-#             if opp_name and len(opp_name.strip()) > 5:
-#                 rfp.opportunity_name = opp_name.strip()
-#                 print(f"[Pipeline] opportunity_name set: {rfp.opportunity_name!r}")
-#             else:
-#                 print(f"[Pipeline] opportunity_name not extracted (got: {opp_name!r})")
+            if opp_name and len(opp_name.strip()) > 5:
+                rfp.opportunity_name = opp_name.strip()
+                print(f"[Pipeline] opportunity_name set: {rfp.opportunity_name!r}")
+            else:
+                print(f"[Pipeline] opportunity_name not extracted (got: {opp_name!r})")
 
-#             if cli_name and len(cli_name.strip()) > 2:
-#                 rfp.client_name = cli_name.strip()
-#                 print(f"[Pipeline] client_name set: {rfp.client_name!r}")
-#             else:
-#                 print(f"[Pipeline] client_name not extracted (got: {cli_name!r})")
+            if cli_name and len(cli_name.strip()) > 2:
+                rfp.client_name = cli_name.strip()
+                print(f"[Pipeline] client_name set: {rfp.client_name!r}")
+            else:
+                print(f"[Pipeline] client_name not extracted (got: {cli_name!r})")
 
-#             _safe_commit(db, "metadata")
-#         except Exception as meta_exc:
-#             print(f"[Pipeline] Metadata extraction skipped: {meta_exc}")
-#             try:
-#                 db.rollback()
-#             except Exception:
-#                 pass
+            _safe_commit(db, "metadata")
+        except Exception as meta_exc:
+            print(f"[Pipeline] Metadata extraction skipped: {meta_exc}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
 
-#         # ── Clause extraction ──────────────────────────────────────────────────
-#         # IMPORTANT: do NOT pass `db` here.
-#         # extract_all_clauses v2 opens its own fresh session per clause lookup,
-#         # so no DB connection is ever held open during an Ollama call.
-#         update("processing", 50, "Extracting clauses (with learning context)")
+        # ── Clause extraction ──────────────────────────────────────────────────
+        # IMPORTANT: do NOT pass `db` here.
+        # extract_all_clauses v2 opens its own fresh session per clause lookup,
+        # so no DB connection is ever held open during an Ollama call.
+        update("processing", 50, "Extracting clauses (with learning context)")
 
-#         extraction_results = {}
-#         try:
-#             extraction_results = extract_all_clauses(
-#                 doc_name=doc_name,
-#                 model="llama3.2",
-#                 offering=primary_offering,
-#                 solution=primary_solution,
-#                 # db intentionally omitted — extractor manages its own sessions
-#             )
-#         except Exception as ext_exc:
-#             print(f"[Pipeline] Clause extraction error: {ext_exc}")
-#             # Continue — we'll save whatever partial results we have
+        extraction_results = {}
+        try:
+            extraction_results = extract_all_clauses(
+                doc_name=doc_name,
+                model="llama3.2",
+                offering=primary_offering,
+                solution=primary_solution,
+                # db intentionally omitted — extractor manages its own sessions
+            )
+        except Exception as ext_exc:
+            print(f"[Pipeline] Clause extraction error: {ext_exc}")
+            # Continue — we'll save whatever partial results we have
 
-#         # ── Learned-rule lookup ────────────────────────────────────────────────
-#         # Fresh session per clause type — closed immediately after the query.
-#         update("processing", 70, "Evaluating risk + checking learned rules")
+        # ── Learned-rule lookup ────────────────────────────────────────────────
+        # Fresh session per clause type — closed immediately after the query.
+        update("processing", 70, "Evaluating risk + checking learned rules")
 
-#         CLAUSE_ORDER = [
-#             "liability", "insurance", "scope", "payment", "deliverables",
-#             "personnel", "ld", "penalties", "termination", "eligibility",
-#         ]
+        CLAUSE_ORDER = [
+            "liability", "insurance", "scope", "payment", "deliverables",
+            "personnel", "ld", "penalties", "termination", "eligibility",
+        ]
 
-#         from rules.learning_store import get_learned_rule
-#         learned_rule_ids: dict = {}
-#         for ct in CLAUSE_ORDER:
-#             _db2 = _fresh_db()
-#             try:
-#                 rule_text = get_learned_rule(ct, primary_offering, primary_solution, _db2)
-#                 if rule_text:
-#                     rule_row = _db2.query(LearnedRule).filter(
-#                         LearnedRule.clause_type == ct,
-#                         LearnedRule.is_active   == True,
-#                     ).first()
-#                     if rule_row:
-#                         learned_rule_ids[ct] = rule_row.id
-#                         print(f"[Pipeline] Learned rule active: {ct} / {primary_offering}")
-#             except Exception as lr_err:
-#                 print(f"[Pipeline] Learned rule lookup failed ({ct}): {lr_err}")
-#             finally:
-#                 try:
-#                     _db2.close()
-#                 except Exception:
-#                     pass
+        from rules.learning_store import get_learned_rule
+        learned_rule_ids: dict = {}
+        for ct in CLAUSE_ORDER:
+            _db2 = _fresh_db()
+            try:
+                rule_text = get_learned_rule(ct, primary_offering, primary_solution, _db2)
+                if rule_text:
+                    rule_row = _db2.query(LearnedRule).filter(
+                        LearnedRule.clause_type == ct,
+                        LearnedRule.is_active   == True,
+                    ).first()
+                    if rule_row:
+                        learned_rule_ids[ct] = rule_row.id
+                        print(f"[Pipeline] Learned rule active: {ct} / {primary_offering}")
+            except Exception as lr_err:
+                print(f"[Pipeline] Learned rule lookup failed ({ct}): {lr_err}")
+            finally:
+                try:
+                    _db2.close()
+                except Exception:
+                    pass
 
-#         # ── Risk evaluation + feedback adjustment ──────────────────────────────
-#         update("processing", 82, "Saving results")
+        # ── Risk evaluation + feedback adjustment ──────────────────────────────
+        update("processing", 82, "Saving results")
 
-#         for ct in CLAUSE_ORDER:
-#             ext  = extraction_results.get(ct, {})
-#             exd  = ext.get("extracted", {})
+        for ct in CLAUSE_ORDER:
+            ext  = extraction_results.get(ct, {})
+            exd  = ext.get("extracted", {})
 
-#             try:
-#                 risk = evaluate_clause(ct, exd)
-#             except Exception as re_err:
-#                 risk = RiskResult(
-#                     clause_name=ct,
-#                     risk_level="NEEDS_REVIEW",
-#                     risk_description=f"Evaluation failed: {re_err}",
-#                     auto_remark="",
-#                 )
+            try:
+                risk = evaluate_clause(ct, exd)
+            except Exception as re_err:
+                risk = RiskResult(
+                    clause_name=ct,
+                    risk_level="NEEDS_REVIEW",
+                    risk_description=f"Evaluation failed: {re_err}",
+                    auto_remark="",
+                )
 
-#             # Feedback adjustment — fresh session, closed immediately
-#             adj_level = adj_reason = adj_conf = None
-#             adj_count = 0
-#             _db3 = _fresh_db()
-#             try:
-#                 from rules.feedback_engine import get_adjustment
-#                 adj = get_adjustment(ct, primary_offering, primary_solution, risk.risk_level, _db3)
-#                 adj_level  = adj["adjusted_risk_level"] if adj["applied"] else None
-#                 adj_reason = adj["reason"]              if adj["applied"] else None
-#                 adj_conf   = str(adj["confidence"])     if adj["applied"] else None
-#                 adj_count  = adj["feedback_count"]
-#             except Exception as adj_err:
-#                 print(f"[Pipeline] Adjustment lookup failed ({ct}): {adj_err}")
-#             finally:
-#                 try:
-#                     _db3.close()
-#                 except Exception:
-#                     pass
+            # Feedback adjustment — fresh session, closed immediately
+            adj_level = adj_reason = adj_conf = None
+            adj_count = 0
+            _db3 = _fresh_db()
+            try:
+                from rules.feedback_engine import get_adjustment
+                adj = get_adjustment(ct, primary_offering, primary_solution, risk.risk_level, _db3)
+                adj_level  = adj["adjusted_risk_level"] if adj["applied"] else None
+                adj_reason = adj["reason"]              if adj["applied"] else None
+                adj_conf   = str(adj["confidence"])     if adj["applied"] else None
+                adj_count  = adj["feedback_count"]
+            except Exception as adj_err:
+                print(f"[Pipeline] Adjustment lookup failed ({ct}): {adj_err}")
+            finally:
+                try:
+                    _db3.close()
+                except Exception:
+                    pass
 
-#             cr = ClauseResult(
-#                 rfp_id=rfp_id,
-#                 clause_type=ct,
-#                 clause_text=exd.get("clause_text") or exd.get("summary", ""),
-#                 clause_reference=exd.get("clause_reference", ""),
-#                 page_no=str(exd.get("page_no", "") or ""),
-#                 risk_level=risk.risk_level,
-#                 risk_description=risk.risk_description,
-#                 auto_remark=exd.get("auto_remark", ""),
-#                 needs_exception=bool(exd.get("needs_exception_approval", False)),
-#                 needs_eqcr=bool(exd.get("needs_eqcr", False)),
-#                 deviation_suggested=exd.get("deviation_suggested", "") or "",
-#                 adjusted_risk_level=adj_level,
-#                 adjustment_reason=adj_reason,
-#                 adjustment_confidence=adj_conf,
-#                 feedback_count=adj_count,
-#                 learned_rule_applied=ct in learned_rule_ids,
-#                 learned_rule_id=learned_rule_ids.get(ct),
-#             )
-#             db.add(cr)
+            cr = ClauseResult(
+                rfp_id=rfp_id,
+                clause_type=ct,
+                clause_text=exd.get("clause_text") or exd.get("summary", ""),
+                clause_reference=exd.get("clause_reference", ""),
+                page_no=str(exd.get("page_no", "") or ""),
+                risk_level=risk.risk_level,
+                risk_description=risk.risk_description,
+                auto_remark=exd.get("auto_remark", ""),
+                needs_exception=bool(exd.get("needs_exception_approval", False)),
+                needs_eqcr=bool(exd.get("needs_eqcr", False)),
+                deviation_suggested=exd.get("deviation_suggested", "") or "",
+                adjusted_risk_level=adj_level,
+                adjustment_reason=adj_reason,
+                adjustment_confidence=adj_conf,
+                feedback_count=adj_count,
+                learned_rule_applied=ct in learned_rule_ids,
+                learned_rule_id=learned_rule_ids.get(ct),
+            )
+            db.add(cr)
 
-#         # ── DOCX output ────────────────────────────────────────────────────────
-#         from pathlib import Path as _Path
-#         OUTPUT_DIR = _Path("./outputs")
-#         OUTPUT_DIR.mkdir(exist_ok=True)
+        # ── DOCX output ────────────────────────────────────────────────────────
+        from pathlib import Path as _Path
+        OUTPUT_DIR = _Path("./outputs")
+        OUTPUT_DIR.mkdir(exist_ok=True)
 
-#         try:
-#             from output.writer import build_table_rows, fill_ssc1_table
-#             table_rows = build_table_rows({
-#                 ct: {
-#                     "extracted": extraction_results.get(ct, {}).get("extracted", {}),
-#                     "risk": None,
-#                 }
-#                 for ct in CLAUSE_ORDER
-#             })
-#             fill_ssc1_table(
-#                 table_rows,
-#                 "document_for_format.docx",
-#                 str(OUTPUT_DIR / f"{job_id}_ssc1.docx"),
-#                 rfp_name=rfp.opportunity_name or job_id,
-#             )
-#         except Exception as docx_err:
-#             print(f"[Pipeline] DOCX output skipped: {docx_err}")
+        try:
+            from output.writer import build_table_rows, fill_ssc1_table
+            table_rows = build_table_rows({
+                ct: {
+                    "extracted": extraction_results.get(ct, {}).get("extracted", {}),
+                    "risk": None,
+                }
+                for ct in CLAUSE_ORDER
+            })
+            fill_ssc1_table(
+                table_rows,
+                "document_for_format.docx",
+                str(OUTPUT_DIR / f"{job_id}_ssc1.docx"),
+                rfp_name=rfp.opportunity_name or job_id,
+            )
+        except Exception as docx_err:
+            print(f"[Pipeline] DOCX output skipped: {docx_err}")
 
-#         # ── Final commit ───────────────────────────────────────────────────────
-#         rfp.status       = "completed"
-#         rfp.progress     = 100
-#         rfp.current_step = "Done"
-#         db.commit()
-#         print(f"[Pipeline] RFP {rfp_id} completed.")
+        # ── Final commit ───────────────────────────────────────────────────────
+        rfp.status       = "completed"
+        rfp.progress     = 100
+        rfp.current_step = "Done"
+        db.commit()
+        print(f"[Pipeline] RFP {rfp_id} completed.")
 
-#     except Exception as e:
-#         print(f"[Pipeline] RFP {rfp_id} FAILED: {e}")
-#         # Try to mark failed on the main session; if that's dead, open a fresh one.
-#         for _session in [db, _fresh_db()]:
-#             try:
-#                 try:
-#                     _session.rollback()
-#                 except Exception:
-#                     pass
-#                 _session.query(RFP).filter(RFP.id == rfp_id).update({
-#                     "status":        "failed",
-#                     "error_message": str(e),
-#                     "current_step":  "Failed",
-#                 })
-#                 _session.commit()
-#                 break   # succeeded — stop trying
-#             except Exception as db_err:
-#                 print(f"[Pipeline] Could not write failed status: {db_err}")
-#             finally:
-#                 if _session is not db:   # don't double-close the main session
-#                     try:
-#                         _session.close()
-#                     except Exception:
-#                         pass
-#     finally:
-#         try:
-#             db.close()
-#         except Exception:
-#             pass
+    except Exception as e:
+        print(f"[Pipeline] RFP {rfp_id} FAILED: {e}")
+        # Try to mark failed on the main session; if that's dead, open a fresh one.
+        for _session in [db, _fresh_db()]:
+            try:
+                try:
+                    _session.rollback()
+                except Exception:
+                    pass
+                _session.query(RFP).filter(RFP.id == rfp_id).update({
+                    "status":        "failed",
+                    "error_message": str(e),
+                    "current_step":  "Failed",
+                })
+                _session.commit()
+                break   # succeeded — stop trying
+            except Exception as db_err:
+                print(f"[Pipeline] Could not write failed status: {db_err}")
+            finally:
+                if _session is not db:   # don't double-close the main session
+                    try:
+                        _session.close()
+                    except Exception:
+                        pass
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AUTH
@@ -1446,15 +1446,15 @@ from datetime import datetime as _dt
 # ─────────────────────────────────────────────────────────────────────────────
  
 def tq_score_item_to_dict(item) -> dict:
+    """Serialise one TQScoreItem row to the API response shape."""
     try:    strengths = json.loads(item.strengths_json or "[]")
     except: strengths = []
     try:    gaps = json.loads(item.gaps_json or "[]")
     except: gaps = []
-    try:    annexure_pages = json.loads(getattr(item, "annexure_pages_json", None) or "[]")
-    except: annexure_pages = []
+    try:    discrepancies = json.loads(getattr(item, "discrepancies_json", "[]") or "[]")
+    except: discrepancies = []
  
-    raw_score = item.score
- 
+    raw_score      = item.score
     is_pending     = raw_score in ("-1", -1) or getattr(item, "requires_live_assessment", False)
     is_comparative = raw_score in ("-2", -2) or getattr(item, "requires_comparative_evaluation", False)
  
@@ -1462,11 +1462,6 @@ def tq_score_item_to_dict(item) -> dict:
     pct_val   = None if (is_pending or is_comparative) else float(item.score_percentage or 0)
  
     layer = getattr(item, "evaluation_layer", None) or "technical_document"
-    if layer == "technical_document":
-        if is_comparative:
-            layer = "financial"
-        elif is_pending and getattr(item, "requires_live_assessment", False):
-            layer = "technical_presentation"
  
     return {
         "id":                              item.id,
@@ -1478,6 +1473,8 @@ def tq_score_item_to_dict(item) -> dict:
         "justification":                   item.justification or "",
         "strengths":                       strengths,
         "gaps":                            gaps,
+        "discrepancies":                   discrepancies,   # NEW
+        "formula_hint":                    getattr(item, "formula_hint", "") or "",  # NEW
         "evidence_found":                  item.evidence_found or False,
         "is_sub_item":                     item.is_sub_item or False,
         "parent_parameter":                item.parent_parameter or "",
@@ -1486,8 +1483,6 @@ def tq_score_item_to_dict(item) -> dict:
         "evaluation_layer":                layer,
         "requires_live_assessment":        is_pending,
         "requires_comparative_evaluation": is_comparative,
-        # v4: annexure page references from proposal compliance table
-        "annexure_pages":                  annexure_pages,
     }
  
  
@@ -1497,27 +1492,29 @@ def tq_score_item_to_dict(item) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
  
 def tq_evaluation_to_dict(ev, include_scores: bool = True) -> dict:
-    # Safe getattr with defaults for columns added in v3
+    """Serialise a TQEvaluation row to the full API response shape."""
+ 
     def _g(attr, default=None):
         return getattr(ev, attr, default)
  
-    # Parse qualification JSON
     qualification = None
     try:
         raw_q = _g("qualification_json")
-        if raw_q:
-            qualification = json.loads(raw_q)
-    except Exception:
-        pass
+        if raw_q: qualification = json.loads(raw_q)
+    except Exception: pass
  
-    # Parse financial evaluation JSON
     financial_evaluation = None
     try:
         raw_fe = _g("financial_methodology_json")
-        if raw_fe:
-            financial_evaluation = json.loads(raw_fe)
-    except Exception:
-        pass
+        if raw_fe: financial_evaluation = json.loads(raw_fe)
+    except Exception: pass
+ 
+    # Global discrepancies (new field)
+    global_discrepancies = []
+    try:
+        raw_gd = _g("global_discrepancies_json")
+        if raw_gd: global_discrepancies = json.loads(raw_gd)
+    except Exception: pass
  
     total_scored_raw = ev.total_scored or "0"
     total_pct_raw    = ev.total_percentage or "0"
@@ -1530,26 +1527,18 @@ def tq_evaluation_to_dict(ev, include_scores: bool = True) -> dict:
         "proposal_file_name":     ev.proposal_file_name or "",
         "evaluation_title":       ev.evaluation_title or "Technical Evaluation",
         "grand_total_marks":      ev.grand_total_marks or 100,
- 
-        # Three-layer breakdown
         "technical_document_max": _g("scoreable_total", 0) or 0,
         "live_assessment_marks":  _g("live_assessment_marks", 0) or 0,
         "financial_marks":        _g("financial_marks", 0) or 0,
- 
-        # What we can score from the document
         "total_scored":           total_scored_val,
-        "total_percentage":       total_pct_val,   # over technical_document_max only
- 
-        # Formula + qualification
+        "total_percentage":       total_pct_val,
         "final_score_formula":    _g("final_score_formula"),
         "financial_evaluation":   financial_evaluation,
         "qualification":          qualification,
- 
-        # Schema quality
         "schema_valid":           _g("schema_valid"),
         "schema_warning":         _g("schema_warning"),
- 
-        # Pipeline state
+        "global_discrepancies":   global_discrepancies,       # NEW
+        "discrepancy_count":      len(global_discrepancies),  # NEW
         "status":                 ev.status or "queued",
         "progress":               ev.progress or 0,
         "current_step":           ev.current_step or "",
@@ -1571,32 +1560,33 @@ TQ_UPLOAD_DIR = Path("./tq_uploads")
 TQ_UPLOAD_DIR.mkdir(exist_ok=True)
  
  
-def run_tq_evaluation_task(tq_eval_id: int, rfp_doc_name: str,
-                            proposal_path: str, proposal_doc_name: str):
+def run_tq_evaluation_task(
+    tq_eval_id:       int,
+    rfp_doc_name:     str,
+    proposal_path:    str,
+    proposal_doc_name: str,
+):
     """
-    Background task: full TQ evaluation pipeline (v5, three-layer aware).
+    Background task: full TQ evaluation pipeline.
  
-    Session lifecycle mirrors the robust pattern from run_pipeline_task:
-      - Short-lived sessions for progress updates
-      - No open DB session during Ollama calls
-      - Final session only for persistence
+    Session lifecycle:
+    - Short-lived sessions for progress updates (never held during Ollama calls)
+    - Single final session for persisting all results
     """
     from database import SessionLocal, TQEvaluation, TQScoreItem
-    from core.tq_extractor import run_tq_evaluation   # v5
+    from core.tq_extractor import run_tq_evaluation
  
-    # ── Mark as processing ────────────────────────────────────────────────────
+    # ── Mark processing ───────────────────────────────────────────────────────
     db = SessionLocal()
     try:
         ev = db.query(TQEvaluation).filter(TQEvaluation.id == tq_eval_id).first()
-        if not ev:
-            return
+        if not ev: return
         ev.status = "processing"
         db.commit()
     finally:
         db.close()
-    db = None
  
-    # ── Progress callback (short-lived sessions) ──────────────────────────────
+    # ── Progress callback (own short-lived session each call) ─────────────────
     def _progress(step: str, pct: int):
         _db = SessionLocal()
         try:
@@ -1611,7 +1601,7 @@ def run_tq_evaluation_task(tq_eval_id: int, rfp_doc_name: str,
             try: _db.close()
             except Exception: pass
  
-    # ── Run evaluation (no open DB session) ───────────────────────────────────
+    # ── Run evaluation (no open DB session during Ollama calls) ──────────────
     result = None
     try:
         result = run_tq_evaluation(
@@ -1625,7 +1615,8 @@ def run_tq_evaluation_task(tq_eval_id: int, rfp_doc_name: str,
         _db = SessionLocal()
         try:
             _db.query(TQEvaluation).filter(TQEvaluation.id == tq_eval_id).update({
-                "status": "failed", "error_message": str(e), "current_step": "Failed"})
+                "status": "failed", "error_message": str(e), "current_step": "Failed"
+            })
             _db.commit()
         except Exception: pass
         finally:
@@ -1637,22 +1628,17 @@ def run_tq_evaluation_task(tq_eval_id: int, rfp_doc_name: str,
     db = SessionLocal()
     try:
         ev = db.query(TQEvaluation).filter(TQEvaluation.id == tq_eval_id).first()
-        if not ev:
-            return
+        if not ev: return
  
         for i, scored in enumerate(result.get("scores", [])):
-            layer       = scored.get("evaluation_layer", "technical_document")
-            raw_score   = scored.get("score")
-            is_pending  = scored.get("requires_live_assessment", False) or raw_score is None and layer == "technical_presentation"
-            is_comp     = scored.get("requires_comparative_evaluation", False) or layer == "financial"
+            layer      = scored.get("evaluation_layer", "technical_document")
+            raw_score  = scored.get("score")
+            is_pending = scored.get("requires_live_assessment", False) or raw_score is None
+            is_comp    = scored.get("requires_comparative_evaluation", False)
  
-            # Sentinels: -1 = pending, -2 = comparative/financial
-            if is_comp:
-                stored_score = "-2"
-                stored_pct   = "-2"
+            if is_comp:     stored_score = "-2"; stored_pct = "-2"
             elif is_pending or raw_score is None:
-                stored_score = "-1"
-                stored_pct   = "-1"
+                             stored_score = "-1"; stored_pct = "-1"
             else:
                 stored_score = str(raw_score)
                 stored_pct   = str(scored.get("score_percentage", 0))
@@ -1675,26 +1661,30 @@ def run_tq_evaluation_task(tq_eval_id: int, rfp_doc_name: str,
                 requires_live_assessment = is_pending,
             )
  
-            # Attach extra columns if they exist (added by migration)
+            # New fields — set safely (columns added by migration)
             def _set(obj, attr, val):
                 try: setattr(obj, attr, val)
                 except Exception: pass
  
             _set(item, "evaluation_layer",                layer)
             _set(item, "requires_comparative_evaluation", is_comp)
+            _set(item, "discrepancies_json",
+                 json.dumps(scored.get("discrepancies", [])))
+            _set(item, "formula_hint",
+                 scored.get("formula_hint", ""))
  
             db.add(item)
  
         # ── Update evaluation record ──────────────────────────────────────────
-        ev.evaluation_title    = result.get("evaluation_title", "Technical Evaluation")
-        ev.grand_total_marks   = result.get("grand_total_marks", 100)
-        ev.total_scored        = str(result.get("total_scored", 0))
-        ev.total_percentage    = str(result.get("total_percentage", 0))
-        ev.status              = "completed"
-        ev.progress            = 100
-        ev.current_step        = "Evaluation complete"
-        ev.completed_at        = _dt.utcnow()
-        ev.error_message       = result.get("error")
+        ev.evaluation_title  = result.get("evaluation_title", "Technical Evaluation")
+        ev.grand_total_marks = result.get("grand_total_marks", 100)
+        ev.total_scored      = str(result.get("total_scored", 0))
+        ev.total_percentage  = str(result.get("total_percentage", 0))
+        ev.status            = "completed"
+        ev.progress          = 100
+        ev.current_step      = "Evaluation complete"
+        ev.completed_at      = _dt.utcnow()
+        ev.error_message     = result.get("error")
  
         def _sev(attr, val):
             try: setattr(ev, attr, val)
@@ -1710,27 +1700,28 @@ def run_tq_evaluation_task(tq_eval_id: int, rfp_doc_name: str,
              json.dumps(result.get("financial_evaluation") or {}))
         _sev("qualification_json",
              json.dumps(result.get("qualification") or {}))
+        _sev("global_discrepancies_json",           # NEW
+             json.dumps(result.get("global_discrepancies") or []))
  
         db.commit()
  
         td_max = result.get("technical_document_max", ev.grand_total_marks)
-        print(f"[TQ] Evaluation {tq_eval_id} done → "
-              f"Technical(doc): {ev.total_scored}/{td_max} ({ev.total_percentage}%) | "
-              f"Live: {result.get('live_assessment_marks', 0)} marks pending | "
-              f"Financial: {result.get('financial_marks', 0)} marks comparative | "
-              f"fin_opens={result.get('qualification', {}).get('financial_bid_opens')}")
+        discs  = result.get("global_discrepancies") or []
+        print(f"[TQ] Eval {tq_eval_id} persisted → "
+              f"{ev.total_scored}/{td_max} ({ev.total_percentage}%) | "
+              f"{len(discs)} discrepancy/ies")
  
     except Exception as e:
-        print(f"[TQ] Persist failed for evaluation {tq_eval_id}: {e}")
+        print(f"[TQ] Persist error eval {tq_eval_id}: {e}")
         try:
             db.query(TQEvaluation).filter(TQEvaluation.id == tq_eval_id).update({
-                "status": "failed", "error_message": str(e), "current_step": "Failed"})
+                "status": "failed", "error_message": str(e), "current_step": "Failed"
+            })
             db.commit()
         except Exception: pass
     finally:
         try: db.close()
         except Exception: pass
- 
  
 
 
